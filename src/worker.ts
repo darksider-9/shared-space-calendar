@@ -16,6 +16,7 @@ type SpaceRole = "owner" | "admin" | "member";
 type InviteStatus = "pending" | "accepted" | "declined" | "cancelled";
 type RequestStatus = "pending" | "approved" | "declined";
 type EventSource = "manual" | "rules" | "ai";
+type PlaceStatus = "wishlist" | "planned" | "visited";
 
 interface StoredUser {
   id: string;
@@ -87,24 +88,50 @@ interface StoredJoinRequest {
 
 interface StoredEvent {
   id: string;
+  /** 首次创建事件的空间。保留该字段用于兼容旧数据。 */
   spaceId: string;
+  /** 同一事件可以出现在多个空间，公共字段只保存一份。 */
+  spaceIds: string[];
+  /** 每个空间分别保存该空间内的归属成员。 */
+  assignmentsBySpace: Record<string, string[]>;
   title: string;
   startDate: string;
   startTime: string | null;
   endTime: string | null;
   allDay: boolean;
   location: string;
+  placeId: string | null;
+  placeAddress: string;
+  latitude: number | null;
+  longitude: number | null;
   companions: string;
   notes: string;
   createdBy: string;
+  /** 兼容旧前端，读取时会被当前空间的 assignmentsBySpace 覆盖。 */
   assignedUserIds: string[];
   source: EventSource;
   createdAt: string;
   updatedAt: string;
 }
 
+interface StoredPlace {
+  id: string;
+  spaceId: string;
+  name: string;
+  address: string;
+  latitude: number | null;
+  longitude: number | null;
+  category: string;
+  status: PlaceStatus;
+  notes: string;
+  createdBy: string;
+  likedByUserIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface AppData {
-  version: 2;
+  version: 3;
   revision: number;
   users: StoredUser[];
   sessions: StoredSession[];
@@ -113,6 +140,7 @@ interface AppData {
   spaceInvitations: StoredSpaceInvitation[];
   joinRequests: StoredJoinRequest[];
   events: StoredEvent[];
+  places: StoredPlace[];
   updatedAt: string;
 }
 
@@ -573,7 +601,20 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
       data.spaceMembers = data.spaceMembers.filter((item) => item.spaceId !== spaceId);
       data.spaceInvitations = data.spaceInvitations.filter((item) => item.spaceId !== spaceId);
       data.joinRequests = data.joinRequests.filter((item) => item.spaceId !== spaceId);
-      data.events = data.events.filter((item) => item.spaceId !== spaceId);
+      const removedPlaceIds = new Set(data.places.filter((item) => item.spaceId === spaceId).map((item) => item.id));
+      data.events = data.events
+        .map((event) => {
+          if (eventSpaceIds(event).includes(spaceId)) {
+            event.spaceIds = eventSpaceIds(event).filter((id) => id !== spaceId);
+            delete event.assignmentsBySpace[spaceId];
+            if (event.spaceId === spaceId && event.spaceIds.length) event.spaceId = event.spaceIds[0];
+            event.assignedUserIds = event.assignmentsBySpace[event.spaceId] ?? [];
+          }
+          if (event.placeId && removedPlaceIds.has(event.placeId)) event.placeId = null;
+          return event;
+        })
+        .filter((event) => event.spaceIds.length > 0);
+      data.places = data.places.filter((item) => item.spaceId !== spaceId);
       return null;
     });
     return json({ ok: true });
@@ -636,12 +677,14 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
         }
       }
       data.spaceMembers = data.spaceMembers.filter((item) => !(item.spaceId === spaceId && item.userId === targetUserId));
-      data.events = data.events.map((event) =>
-        event.spaceId === spaceId
-          ? { ...event, assignedUserIds: event.assignedUserIds.filter((id) => id !== targetUserId), updatedAt: new Date().toISOString() }
-          : event,
-      );
-      data.events = data.events.filter((event) => event.spaceId !== spaceId || event.assignedUserIds.length > 0);
+      data.events = data.events.map((event) => {
+        if (!eventSpaceIds(event).includes(spaceId)) return event;
+        const remaining = eventAssignments(event, spaceId).filter((id) => id !== targetUserId);
+        event.assignmentsBySpace[spaceId] = remaining;
+        if (event.spaceId === spaceId) event.assignedUserIds = remaining;
+        event.updatedAt = new Date().toISOString();
+        return event;
+      });
       return null;
     });
     return json({ ok: true });
@@ -747,6 +790,111 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     return json({ ok: true });
   }
 
+  const placesMatch = path.match(/^\/api\/spaces\/([^/]+)\/places$/);
+  if (placesMatch && method === "GET") {
+    const spaceId = cleanId(placesMatch[1]);
+    requireSpaceContext(authData, user.id, spaceId);
+    const status = url.searchParams.get("status");
+    const eventPlaceIds = new Set(
+      authData.events
+        .filter((event) => eventSpaceIds(event).includes(spaceId) && event.placeId)
+        .map((event) => event.placeId as string),
+    );
+    const places = authData.places
+      .filter((place) => place.spaceId === spaceId || eventPlaceIds.has(place.id))
+      .map((place) => publicPlace(authData, place, user.id, spaceId))
+      .filter((place) => !status || status === "all" || place.status === status)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return json({ places, revision: authData.revision });
+  }
+
+  if (placesMatch && method === "POST") {
+    assertSameOrigin(request);
+    const spaceId = cleanId(placesMatch[1]);
+    const body = await readJson<Record<string, unknown>>(request);
+    const place = await mutateData(env, (data) => {
+      requireSpaceContext(data, user.id, spaceId);
+      const now = new Date().toISOString();
+      const stored: StoredPlace = {
+        id: crypto.randomUUID(),
+        spaceId,
+        ...normalizePlaceInput(body),
+        createdBy: user.id,
+        likedByUserIds: [],
+        createdAt: now,
+        updatedAt: now,
+      };
+      data.places.push(stored);
+      return publicPlace(data, stored, user.id);
+    });
+    return json({ place }, 201);
+  }
+
+  const placeMatch = path.match(/^\/api\/places\/([^/]+)$/);
+  if (placeMatch && method === "PATCH") {
+    assertSameOrigin(request);
+    const placeId = cleanId(placeMatch[1]);
+    const body = await readJson<Record<string, unknown>>(request);
+    const place = await mutateData(env, (data) => {
+      const stored = data.places.find((item) => item.id === placeId);
+      if (!stored) throw new HttpError(404, "地点不存在");
+      const context = requireSpaceContext(data, user.id, stored.spaceId);
+      if (!context.isAdmin && stored.createdBy !== user.id) throw new HttpError(403, "只能修改自己添加的地点");
+      Object.assign(stored, normalizePlaceInput(body, stored), { updatedAt: new Date().toISOString() });
+      data.events.forEach((event) => {
+        if (event.placeId === stored.id) {
+          event.location = stored.name;
+          event.placeAddress = stored.address;
+          event.latitude = stored.latitude;
+          event.longitude = stored.longitude;
+          event.updatedAt = stored.updatedAt;
+        }
+      });
+      return publicPlace(data, stored, user.id);
+    });
+    return json({ place });
+  }
+
+  if (placeMatch && method === "DELETE") {
+    assertSameOrigin(request);
+    const placeId = cleanId(placeMatch[1]);
+    await mutateData(env, (data) => {
+      const stored = data.places.find((item) => item.id === placeId);
+      if (!stored) throw new HttpError(404, "地点不存在");
+      const context = requireSpaceContext(data, user.id, stored.spaceId);
+      if (!context.isAdmin && stored.createdBy !== user.id) throw new HttpError(403, "只能删除自己添加的地点");
+      data.places = data.places.filter((item) => item.id !== placeId);
+      data.events.forEach((event) => {
+        if (event.placeId === placeId) event.placeId = null;
+      });
+      return null;
+    });
+    return json({ ok: true });
+  }
+
+  const placeLikeMatch = path.match(/^\/api\/places\/([^/]+)\/like$/);
+  if (placeLikeMatch && method === "POST") {
+    assertSameOrigin(request);
+    const placeId = cleanId(placeLikeMatch[1]);
+    const place = await mutateData(env, (data) => {
+      const stored = data.places.find((item) => item.id === placeId);
+      if (!stored) throw new HttpError(404, "地点不存在");
+      const requestedViewSpaceId = url.searchParams.get("spaceId");
+      const accessibleSpaceId = requestedViewSpaceId
+        && placeVisibleInSpace(data, stored.id, requestedViewSpaceId)
+        && data.spaceMembers.some((member) => member.spaceId === requestedViewSpaceId && member.userId === user.id)
+        ? requestedViewSpaceId
+        : findAccessiblePlaceSpace(data, stored, user.id);
+      requireSpaceContext(data, user.id, accessibleSpaceId);
+      stored.likedByUserIds = stored.likedByUserIds.includes(user.id)
+        ? stored.likedByUserIds.filter((id) => id !== user.id)
+        : [...stored.likedByUserIds, user.id];
+      stored.updatedAt = new Date().toISOString();
+      return publicPlace(data, stored, user.id, accessibleSpaceId);
+    });
+    return json({ place });
+  }
+
   const eventsMatch = path.match(/^\/api\/spaces\/([^/]+)\/events$/);
   if (eventsMatch && method === "GET") {
     const spaceId = cleanId(eventsMatch[1]);
@@ -754,9 +902,9 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     const start = requireDate(url.searchParams.get("start"));
     const end = requireDate(url.searchParams.get("end"));
     const events = authData.events
-      .filter((event) => event.spaceId === spaceId && event.startDate >= start && event.startDate <= end)
+      .filter((event) => eventSpaceIds(event).includes(spaceId) && event.startDate >= start && event.startDate <= end)
       .sort(compareEvents)
-      .map(publicEvent);
+      .map((event) => publicEvent(event, spaceId));
     return json({ events, revision: authData.revision });
   }
 
@@ -767,18 +915,24 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     const event = await mutateData(env, (data) => {
       const context = requireSpaceContext(data, user.id, spaceId);
       const normalized = normalizeEventInput(data, context, user.id, body);
+      const spaceIds = normalizeEventSpaceIds(data, user.id, spaceId, body.spaceIds);
+      const assignmentsBySpace = buildAssignmentsBySpace(data, user.id, spaceId, spaceIds, normalized.assignedUserIds);
       const now = new Date().toISOString();
       const stored: StoredEvent = {
         id: crypto.randomUUID(),
         spaceId,
+        spaceIds,
+        assignmentsBySpace,
         ...normalized,
+        assignedUserIds: assignmentsBySpace[spaceId] ?? [user.id],
         createdBy: user.id,
         source: normalizeEventSource(body.source),
         createdAt: now,
         updatedAt: now,
       };
       data.events.push(stored);
-      return publicEvent(stored);
+      touchPlaceForEvent(data, stored);
+      return publicEvent(stored, spaceId);
     });
     return json({ event }, 201);
   }
@@ -791,11 +945,34 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     const event = await mutateData(env, (data) => {
       const stored = data.events.find((item) => item.id === eventId);
       if (!stored) throw new HttpError(404, "日程不存在");
-      const context = requireSpaceContext(data, user.id, stored.spaceId);
-      assertCanManageEvent(context, stored, user.id);
-      const normalized = normalizeEventInput(data, context, user.id, body, stored);
-      Object.assign(stored, normalized, { updatedAt: new Date().toISOString() });
-      return publicEvent(stored);
+      const currentSpaceId = cleanText(body.currentSpaceId, 100) || findAccessibleEventSpace(data, stored, user.id);
+      const context = requireSpaceContext(data, user.id, currentSpaceId);
+      assertCanManageEvent(context, stored, user.id, currentSpaceId);
+      const normalized = normalizeEventInput(data, context, user.id, body, stored, currentSpaceId);
+      const previousSpaceIds = eventSpaceIds(stored);
+      const requestedSpaceIds = Array.isArray(body.spaceIds) && stored.createdBy === user.id
+        ? normalizeEventSpaceIds(data, user.id, currentSpaceId, body.spaceIds)
+        : previousSpaceIds;
+      const assignmentsBySpace: Record<string, string[]> = {};
+      for (const linkedSpaceId of requestedSpaceIds) {
+        if (linkedSpaceId === currentSpaceId) {
+          assignmentsBySpace[linkedSpaceId] = normalized.assignedUserIds;
+        } else {
+          const valid = new Set(data.spaceMembers.filter((member) => member.spaceId === linkedSpaceId).map((member) => member.userId));
+          const previous = stored.assignmentsBySpace?.[linkedSpaceId] ?? stored.assignedUserIds;
+          const filtered = previous.filter((id) => valid.has(id));
+          assignmentsBySpace[linkedSpaceId] = filtered.length ? filtered : valid.has(user.id) ? [user.id] : [];
+        }
+      }
+      Object.assign(stored, normalized, {
+        spaceIds: requestedSpaceIds,
+        assignmentsBySpace,
+        assignedUserIds: assignmentsBySpace[stored.spaceId] ?? assignmentsBySpace[currentSpaceId] ?? [user.id],
+        updatedAt: new Date().toISOString(),
+      });
+      if (!stored.spaceIds.includes(stored.spaceId)) stored.spaceId = stored.spaceIds[0];
+      touchPlaceForEvent(data, stored);
+      return publicEvent(stored, currentSpaceId);
     });
     return json({ event });
   }
@@ -803,12 +980,28 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   if (eventMatch && method === "DELETE") {
     assertSameOrigin(request);
     const eventId = cleanId(eventMatch[1]);
+    const currentSpaceId = cleanId(url.searchParams.get("spaceId"));
+    const mode = url.searchParams.get("mode") === "all" ? "all" : "detach";
     await mutateData(env, (data) => {
       const stored = data.events.find((item) => item.id === eventId);
       if (!stored) throw new HttpError(404, "日程不存在");
-      const context = requireSpaceContext(data, user.id, stored.spaceId);
-      assertCanManageEvent(context, stored, user.id);
-      data.events = data.events.filter((item) => item.id !== eventId);
+      if (!eventSpaceIds(stored).includes(currentSpaceId)) throw new HttpError(404, "当前空间中没有这条日程");
+      const context = requireSpaceContext(data, user.id, currentSpaceId);
+      assertCanManageEvent(context, stored, user.id, currentSpaceId);
+      if (mode === "all") {
+        if (stored.createdBy !== user.id) throw new HttpError(403, "只有日程创建者可以从全部空间彻底删除");
+        data.events = data.events.filter((item) => item.id !== eventId);
+      } else {
+        stored.spaceIds = eventSpaceIds(stored).filter((id) => id !== currentSpaceId);
+        delete stored.assignmentsBySpace[currentSpaceId];
+        if (stored.spaceIds.length === 0) {
+          data.events = data.events.filter((item) => item.id !== eventId);
+        } else {
+          if (stored.spaceId === currentSpaceId) stored.spaceId = stored.spaceIds[0];
+          stored.assignedUserIds = stored.assignmentsBySpace[stored.spaceId] ?? [];
+          stored.updatedAt = new Date().toISOString();
+        }
+      }
       return null;
     });
     return json({ ok: true });
@@ -971,10 +1164,27 @@ function publicAI(space: StoredSpace, canManage: boolean): {
   };
 }
 
-function publicEvent(event: StoredEvent): StoredEvent {
+function eventSpaceIds(event: StoredEvent): string[] {
+  const ids = Array.isArray(event.spaceIds) && event.spaceIds.length ? event.spaceIds : [event.spaceId];
+  return uniqueStrings(ids).filter(Boolean);
+}
+
+function eventAssignments(event: StoredEvent, spaceId: string): string[] {
+  const bySpace = event.assignmentsBySpace && typeof event.assignmentsBySpace === "object"
+    ? event.assignmentsBySpace[spaceId]
+    : undefined;
+  return Array.isArray(bySpace) ? [...bySpace] : spaceId === event.spaceId ? [...event.assignedUserIds] : [];
+}
+
+function publicEvent(event: StoredEvent, currentSpaceId = event.spaceId): StoredEvent {
   return {
     ...event,
-    assignedUserIds: [...event.assignedUserIds],
+    spaceId: currentSpaceId,
+    spaceIds: eventSpaceIds(event),
+    assignmentsBySpace: Object.fromEntries(
+      eventSpaceIds(event).map((spaceId) => [spaceId, eventAssignments(event, spaceId)]),
+    ),
+    assignedUserIds: eventAssignments(event, currentSpaceId),
   };
 }
 
@@ -984,7 +1194,12 @@ function normalizeEventInput(
   actorId: string,
   body: Record<string, unknown>,
   existing?: StoredEvent,
-): Omit<StoredEvent, "id" | "spaceId" | "createdBy" | "source" | "createdAt" | "updatedAt"> {
+  currentSpaceId = context.space.id,
+): Pick<StoredEvent,
+  | "title" | "startDate" | "startTime" | "endTime" | "allDay"
+  | "location" | "placeId" | "placeAddress" | "latitude" | "longitude"
+  | "companions" | "notes" | "assignedUserIds"
+> {
   const title = cleanText(body.title ?? existing?.title, 100);
   if (!title) throw new HttpError(400, "请输入事项名称");
   const startDate = requireDate(String(body.startDate ?? existing?.startDate ?? ""));
@@ -995,15 +1210,30 @@ function normalizeEventInput(
   if (startTime && endTime && endTime <= startTime) throw new HttpError(400, "结束时间必须晚于开始时间");
 
   const validMemberIds = new Set(context.members.map((item) => item.userId));
+  const previousAssignments = existing ? eventAssignments(existing, currentSpaceId) : [actorId];
   let assignedUserIds = Array.isArray(body.assignedUserIds)
     ? uniqueStrings(body.assignedUserIds.map(String)).filter((id) => validMemberIds.has(id))
-    : existing?.assignedUserIds.filter((id) => validMemberIds.has(id)) ?? [actorId];
+    : previousAssignments.filter((id) => validMemberIds.has(id));
 
   if (context.isAdmin) {
-    if (assignedUserIds.length === 0) assignedUserIds = [actorId];
+    if (assignedUserIds.length === 0) assignedUserIds = validMemberIds.has(actorId) ? [actorId] : [];
   } else {
     assignedUserIds = [actorId];
   }
+
+  const hasExplicitPlaceId = Object.prototype.hasOwnProperty.call(body, "placeId");
+  const explicitPlaceId = body.placeId === null || body.placeId === "" ? null : cleanText(body.placeId, 100);
+  const placeId = hasExplicitPlaceId ? explicitPlaceId : existing?.placeId ?? null;
+  const preservesExistingSharedPlace = Boolean(existing && placeId && placeId === existing.placeId);
+  const place = placeId ? data.places.find((item) => item.id === placeId) : undefined;
+  const canUseSelectedPlace = !placeId
+    || Boolean(place && (preservesExistingSharedPlace || !hasExplicitPlaceId || placeVisibleInSpace(data, place.id, currentSpaceId)));
+  if (hasExplicitPlaceId && !canUseSelectedPlace) throw new HttpError(404, "所选地点不在当前空间的地点库或同步日程中");
+
+  const location = place?.name ?? cleanText(body.location ?? existing?.location, 120);
+  const placeAddress = place?.address ?? cleanText(body.placeAddress ?? existing?.placeAddress, 240);
+  const latitude = place?.latitude ?? normalizeCoordinate(body.latitude, existing?.latitude ?? null, -90, 90);
+  const longitude = place?.longitude ?? normalizeCoordinate(body.longitude, existing?.longitude ?? null, -180, 180);
 
   return {
     title,
@@ -1011,17 +1241,144 @@ function normalizeEventInput(
     startTime,
     endTime,
     allDay,
-    location: cleanText(body.location ?? existing?.location, 120),
+    location,
+    placeId: place?.id ?? placeId,
+    placeAddress,
+    latitude,
+    longitude,
     companions: cleanText(body.companions ?? existing?.companions, 160),
     notes: cleanText(body.notes ?? existing?.notes, 1200),
     assignedUserIds,
   };
 }
 
-function assertCanManageEvent(context: SpaceContext, event: StoredEvent, actorId: string): void {
+function normalizeEventSpaceIds(data: AppData, actorId: string, currentSpaceId: string, value: unknown): string[] {
+  const requested = Array.isArray(value) ? uniqueStrings(value.map(String)) : [currentSpaceId];
+  if (!requested.includes(currentSpaceId)) requested.unshift(currentSpaceId);
+  const joined = new Set(data.spaceMembers.filter((member) => member.userId === actorId).map((member) => member.spaceId));
+  const valid = requested.filter((spaceId) => joined.has(spaceId) && data.spaces.some((space) => space.id === spaceId));
+  if (!valid.length) throw new HttpError(400, "至少选择一个你已加入的空间");
+  return valid;
+}
+
+function buildAssignmentsBySpace(
+  data: AppData,
+  actorId: string,
+  currentSpaceId: string,
+  spaceIds: string[],
+  currentAssignments: string[],
+): Record<string, string[]> {
+  const result: Record<string, string[]> = {};
+  for (const spaceId of spaceIds) {
+    if (spaceId === currentSpaceId) {
+      result[spaceId] = [...currentAssignments];
+      continue;
+    }
+    const members = new Set(data.spaceMembers.filter((member) => member.spaceId === spaceId).map((member) => member.userId));
+    result[spaceId] = members.has(actorId) ? [actorId] : [];
+  }
+  return result;
+}
+
+function findAccessibleEventSpace(data: AppData, event: StoredEvent, actorId: string): string {
+  const joined = new Set(data.spaceMembers.filter((member) => member.userId === actorId).map((member) => member.spaceId));
+  const found = eventSpaceIds(event).find((spaceId) => joined.has(spaceId));
+  if (!found) throw new HttpError(403, "你无法访问这条日程所在的空间");
+  return found;
+}
+
+function assertCanManageEvent(context: SpaceContext, event: StoredEvent, actorId: string, currentSpaceId: string): void {
   if (context.isAdmin) return;
-  const isOwnSimpleEvent = event.createdBy === actorId && event.assignedUserIds.length === 1 && event.assignedUserIds[0] === actorId;
+  const assignments = eventAssignments(event, currentSpaceId);
+  const isOwnSimpleEvent = event.createdBy === actorId && assignments.length === 1 && assignments[0] === actorId;
   if (!isOwnSimpleEvent) throw new HttpError(403, "普通成员只能修改或删除自己的日程");
+}
+
+function normalizePlaceInput(body: Record<string, unknown>, existing?: StoredPlace): Pick<StoredPlace,
+  "name" | "address" | "latitude" | "longitude" | "category" | "status" | "notes"
+> {
+  const name = cleanText(body.name ?? existing?.name, 120);
+  if (!name) throw new HttpError(400, "请输入地点名称");
+  const statusValue = String(body.status ?? existing?.status ?? "wishlist");
+  const status: PlaceStatus = statusValue === "planned" ? "planned" : statusValue === "visited" ? "visited" : "wishlist";
+  return {
+    name,
+    address: cleanText(body.address ?? existing?.address, 240),
+    latitude: normalizeCoordinate(body.latitude, existing?.latitude ?? null, -90, 90),
+    longitude: normalizeCoordinate(body.longitude, existing?.longitude ?? null, -180, 180),
+    category: cleanText(body.category ?? existing?.category, 40) || "其他",
+    status,
+    notes: cleanText(body.notes ?? existing?.notes, 800),
+  };
+}
+
+function normalizeCoordinate(value: unknown, fallback: number | null, min: number, max: number): number | null {
+  if (value === undefined) return fallback;
+  if (value === null || value === "") return null;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < min || number > max) throw new HttpError(400, "地点坐标不正确");
+  return Math.round(number * 1_000_000) / 1_000_000;
+}
+
+function publicPlace(data: AppData, place: StoredPlace, currentUserId: string, viewSpaceId = place.spaceId): StoredPlace & {
+  liked: boolean;
+  likeCount: number;
+  relatedEventCount: number;
+  nextEventDate: string | null;
+  isLocal: boolean;
+  canManage: boolean;
+  originSpaceName: string;
+} {
+  const related = data.events.filter((event) => event.placeId === place.id && eventSpaceIds(event).includes(viewSpaceId));
+  const today = localDateString(new Date());
+  const next = related.filter((event) => event.startDate >= today).sort(compareEvents)[0];
+  const hasPastEvent = related.some((event) => event.startDate < today);
+  const effectiveStatus: PlaceStatus = hasPastEvent
+    ? "visited"
+    : next && place.status === "wishlist"
+      ? "planned"
+      : place.status;
+  const sourceMembership = data.spaceMembers.find((member) => member.spaceId === place.spaceId && member.userId === currentUserId);
+  return {
+    ...place,
+    status: effectiveStatus,
+    likedByUserIds: [...place.likedByUserIds],
+    liked: place.likedByUserIds.includes(currentUserId),
+    likeCount: place.likedByUserIds.length,
+    relatedEventCount: related.length,
+    nextEventDate: next?.startDate ?? null,
+    isLocal: place.spaceId === viewSpaceId,
+    canManage: Boolean(sourceMembership && (sourceMembership.role === "owner" || sourceMembership.role === "admin" || place.createdBy === currentUserId)),
+    originSpaceName: data.spaces.find((space) => space.id === place.spaceId)?.name ?? "其他空间",
+  };
+}
+
+function placeVisibleInSpace(data: AppData, placeId: string, spaceId: string): boolean {
+  const place = data.places.find((item) => item.id === placeId);
+  if (!place) return false;
+  return place.spaceId === spaceId
+    || data.events.some((event) => event.placeId === placeId && eventSpaceIds(event).includes(spaceId));
+}
+
+function findAccessiblePlaceSpace(data: AppData, place: StoredPlace, actorId: string): string {
+  const joined = new Set(data.spaceMembers.filter((member) => member.userId === actorId).map((member) => member.spaceId));
+  if (joined.has(place.spaceId)) return place.spaceId;
+  const linkedSpace = data.events
+    .filter((event) => event.placeId === place.id)
+    .flatMap((event) => eventSpaceIds(event))
+    .find((spaceId) => joined.has(spaceId));
+  if (!linkedSpace) throw new HttpError(403, "你无法访问这个地点");
+  return linkedSpace;
+}
+
+function touchPlaceForEvent(data: AppData, event: StoredEvent): void {
+  if (!event.placeId) return;
+  const place = data.places.find((item) => item.id === event.placeId);
+  if (!place) return;
+  const today = localDateString(new Date());
+  if (event.startDate < today) place.status = "visited";
+  else if (place.status !== "visited") place.status = "planned";
+  place.updatedAt = new Date().toISOString();
 }
 
 function normalizeEventSource(value: unknown): EventSource {
@@ -1699,32 +2056,105 @@ async function loadData(env: Env): Promise<{ data: AppData; migrated: boolean }>
   } catch {
     throw new HttpError(500, "存储中的 calendar-data.json 已损坏");
   }
-  const migrated = !isVersion2(parsed);
-  const data = migrated ? migrateData(parsed as LegacyData) : sanitizeVersion2(parsed as AppData);
+  const migrated = !isVersion3(parsed);
+  const data = migrated ? migrateData(parsed) : sanitizeVersion3(parsed as AppData);
   if (migrated) await writeData(env, data);
   return { data, migrated };
 }
 
-function isVersion2(value: unknown): value is AppData {
-  return Boolean(value && typeof value === "object" && (value as { version?: unknown }).version === 2);
+function isVersion3(value: unknown): value is AppData {
+  return Boolean(value && typeof value === "object" && (value as { version?: unknown }).version === 3);
 }
 
-function sanitizeVersion2(data: AppData): AppData {
+function sanitizeVersion3(data: AppData): AppData {
+  const spaces = Array.isArray(data.spaces) ? data.spaces : [];
+  const validSpaceIds = new Set(spaces.map((space) => space.id));
+  const events = (Array.isArray(data.events) ? data.events : []).map((event) => sanitizeEvent(event, validSpaceIds));
   return {
-    version: 2,
+    version: 3,
     revision: Number.isInteger(data.revision) ? data.revision : 0,
     users: Array.isArray(data.users) ? data.users : [],
     sessions: Array.isArray(data.sessions) ? data.sessions : [],
-    spaces: Array.isArray(data.spaces) ? data.spaces : [],
+    spaces,
     spaceMembers: Array.isArray(data.spaceMembers) ? data.spaceMembers : [],
     spaceInvitations: Array.isArray(data.spaceInvitations) ? data.spaceInvitations : [],
     joinRequests: Array.isArray(data.joinRequests) ? data.joinRequests : [],
-    events: Array.isArray(data.events) ? data.events : [],
+    events,
+    places: (Array.isArray(data.places) ? data.places : []).map((place) => ({
+      ...place,
+      address: place.address ?? "",
+      latitude: Number.isFinite(place.latitude) ? place.latitude : null,
+      longitude: Number.isFinite(place.longitude) ? place.longitude : null,
+      category: place.category || "其他",
+      status: place.status === "planned" ? "planned" : place.status === "visited" ? "visited" : "wishlist",
+      notes: place.notes ?? "",
+      likedByUserIds: Array.isArray(place.likedByUserIds) ? uniqueStrings(place.likedByUserIds) : [],
+    })),
     updatedAt: data.updatedAt || new Date().toISOString(),
   };
 }
 
-function migrateData(legacy: LegacyData): AppData {
+function sanitizeEvent(event: StoredEvent, validSpaceIds?: Set<string>): StoredEvent {
+  const rawSpaceIds = Array.isArray(event.spaceIds) && event.spaceIds.length ? event.spaceIds : [event.spaceId];
+  const spaceIds = uniqueStrings(rawSpaceIds).filter((id) => !validSpaceIds || validSpaceIds.has(id));
+  const fallbackSpaceId = spaceIds[0] ?? event.spaceId;
+  const assignmentsBySpace: Record<string, string[]> = {};
+  for (const spaceId of spaceIds) {
+    const existing = event.assignmentsBySpace?.[spaceId];
+    assignmentsBySpace[spaceId] = Array.isArray(existing)
+      ? uniqueStrings(existing)
+      : spaceId === event.spaceId && Array.isArray(event.assignedUserIds)
+        ? uniqueStrings(event.assignedUserIds)
+        : [];
+  }
+  return {
+    ...event,
+    spaceId: spaceIds.includes(event.spaceId) ? event.spaceId : fallbackSpaceId,
+    spaceIds,
+    assignmentsBySpace,
+    location: event.location ?? "",
+    placeId: event.placeId ?? null,
+    placeAddress: event.placeAddress ?? "",
+    latitude: Number.isFinite(event.latitude) ? event.latitude : null,
+    longitude: Number.isFinite(event.longitude) ? event.longitude : null,
+    companions: event.companions ?? "",
+    notes: event.notes ?? "",
+    assignedUserIds: assignmentsBySpace[spaceIds.includes(event.spaceId) ? event.spaceId : fallbackSpaceId] ?? [],
+  };
+}
+
+function migrateData(input: unknown): AppData {
+  const source = input && typeof input === "object" ? input as Record<string, unknown> : {};
+  if (source.version === 2 && Array.isArray(source.users) && Array.isArray(source.spaces)) {
+    const v2 = source as unknown as {
+      revision?: number;
+      users: StoredUser[];
+      sessions?: StoredSession[];
+      spaces: StoredSpace[];
+      spaceMembers?: StoredSpaceMember[];
+      spaceInvitations?: StoredSpaceInvitation[];
+      joinRequests?: StoredJoinRequest[];
+      events?: Array<StoredEvent & { spaceIds?: string[]; assignmentsBySpace?: Record<string, string[]> }>;
+      places?: StoredPlace[];
+      updatedAt?: string;
+    };
+    const validSpaceIds = new Set(v2.spaces.map((space) => space.id));
+    return sanitizeVersion3({
+      version: 3,
+      revision: Number.isInteger(v2.revision) ? Number(v2.revision) + 1 : 1,
+      users: v2.users,
+      sessions: v2.sessions ?? [],
+      spaces: v2.spaces,
+      spaceMembers: v2.spaceMembers ?? [],
+      spaceInvitations: v2.spaceInvitations ?? [],
+      joinRequests: v2.joinRequests ?? [],
+      events: (v2.events ?? []).map((event) => sanitizeEvent(event as StoredEvent, validSpaceIds)),
+      places: v2.places ?? [],
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  const legacy = source as unknown as LegacyData;
   const now = new Date().toISOString();
   const users: StoredUser[] = (legacy.users ?? []).map((user, index) => ({
     id: user.id,
@@ -1757,25 +2187,34 @@ function migrateData(legacy: LegacyData): AppData {
     color: normalizeLegacyColor(legacyColorMap.get(account.id), index),
     joinedAt: account.createdAt,
   }));
-  const events: StoredEvent[] = (legacy.events ?? []).map((event) => ({
-    id: event.id,
-    spaceId: space.id,
-    title: event.title,
-    startDate: event.startDate,
-    startTime: event.startTime,
-    endTime: event.endTime,
-    allDay: event.allDay,
-    location: event.location ?? "",
-    companions: event.companions ?? "",
-    notes: event.notes ?? "",
-    createdBy: event.createdBy,
-    assignedUserIds: event.memberIds?.filter((id) => users.some((account) => account.id === id)) ?? [event.createdBy],
-    source: "manual",
-    createdAt: event.createdAt,
-    updatedAt: event.updatedAt,
-  }));
+  const events: StoredEvent[] = (legacy.events ?? []).map((event) => {
+    const assigned = event.memberIds?.filter((id) => users.some((account) => account.id === id)) ?? [event.createdBy];
+    return {
+      id: event.id,
+      spaceId: space.id,
+      spaceIds: [space.id],
+      assignmentsBySpace: { [space.id]: assigned },
+      title: event.title,
+      startDate: event.startDate,
+      startTime: event.startTime,
+      endTime: event.endTime,
+      allDay: event.allDay,
+      location: event.location ?? "",
+      placeId: null,
+      placeAddress: "",
+      latitude: null,
+      longitude: null,
+      companions: event.companions ?? "",
+      notes: event.notes ?? "",
+      createdBy: event.createdBy,
+      assignedUserIds: assigned,
+      source: "manual",
+      createdAt: event.createdAt,
+      updatedAt: event.updatedAt,
+    };
+  });
   return {
-    version: 2,
+    version: 3,
     revision: 1,
     users,
     sessions: Array.isArray(legacy.sessions) ? legacy.sessions : [],
@@ -1784,6 +2223,7 @@ function migrateData(legacy: LegacyData): AppData {
     spaceInvitations: [],
     joinRequests: [],
     events,
+    places: [],
     updatedAt: now,
   };
 }
@@ -1800,7 +2240,7 @@ function normalizeLegacyColor(value: string | undefined, index: number): string 
 
 function emptyData(): AppData {
   return {
-    version: 2,
+    version: 3,
     revision: 0,
     users: [],
     sessions: [],
@@ -1809,6 +2249,7 @@ function emptyData(): AppData {
     spaceInvitations: [],
     joinRequests: [],
     events: [],
+    places: [],
     updatedAt: new Date().toISOString(),
   };
 }
