@@ -1,14 +1,16 @@
-const CACHE = "shared-space-calendar-v3.3.0";
+const CACHE = "shared-space-calendar-v3.4.0";
 const SHELL = [
   "/",
-  "/styles.css?v=3.3.0",
-  "/planner-enhancements.css?v=3.3.0",
-  "/planner-enhancements.js?v=3.3.0",
-  "/food-roulette.css?v=3.3.0",
-  "/food-library.js?v=3.3.0",
-  "/food-roulette.js?v=3.3.0",
-  "/assets/main.js?v=3.3.0",
-  "/manifest.webmanifest?v=3.3.0",
+  "/styles.css?v=3.4.0",
+  "/planner-enhancements.css?v=3.4.0",
+  "/planner-enhancements.js?v=3.4.0",
+  "/food-roulette.css?v=3.4.0",
+  "/food-library.js?v=3.4.0",
+  "/food-roulette.js?v=3.4.0",
+  "/profile-enhancements.css?v=3.4.0",
+  "/profile-enhancements.js?v=3.4.0",
+  "/assets/main.js?v=3.4.0",
+  "/manifest.webmanifest?v=3.4.0",
   "/icons/icon-192.png",
 ];
 
