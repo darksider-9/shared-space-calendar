@@ -1,10 +1,10 @@
-const CACHE = "shared-space-calendar-v2.1";
+const CACHE = "shared-space-calendar-v2.1.1";
 
 const SHELL = [
   "/",
-  "/styles.css",
-  "/assets/main.js",
-  "/manifest.webmanifest",
+  "/styles.css?v=2.1.1",
+  "/assets/main.js?v=2.1.1",
+  "/manifest.webmanifest?v=2.1.1",
   "/icons/icon-192.png",
 ];
 
