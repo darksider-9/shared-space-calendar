@@ -572,7 +572,6 @@ function renderTopbar(): string {
           <nav class="view-tabs" aria-label="日历视图">
             <button class="${state.viewMode === "month" ? "active" : ""}" data-view="month">月历</button>
             <button class="${state.viewMode === "day" ? "active" : ""}" data-view="day">日时间轴</button>
-            <button class="${state.viewMode === "map" ? "active" : ""}" data-view="map">共享地图</button>
           </nav>
         </div>
       </div>
@@ -867,7 +866,7 @@ function renderEventModal(): string {
                 : ""}
               ${state.places.map((place) => `<option value="${place.id}" ${place.id === (event?.placeId ?? prefillPlace?.id) ? "selected" : ""}>${escapeHtml(place.name)} · ${placeStatusLabel(place.status)}${place.isLocal ? "" : ` · 来自${escapeHtml(place.originSpaceName)}`}</option>`).join("")}
             </select>
-            <button class="secondary-btn" type="button" id="open-map-from-event" ${editable ? "" : "disabled"}>打开共享地图</button>
+            <button class="secondary-btn" type="button" id="open-map-from-event" ${editable ? "" : "disabled"}>在地图上标点</button>
           </div>
           <input class="field" name="location" maxlength="120" value="${escapeAttr(event?.location ?? selectedPlace?.name ?? "")}" placeholder="地点名称，也可以直接手动填写" ${disabled} />
           <input class="field" name="placeAddress" maxlength="240" value="${escapeAttr(event?.placeAddress ?? selectedPlace?.address ?? "")}" placeholder="具体地址（可不填）" ${disabled} />
@@ -1141,10 +1140,7 @@ function attachModalHandlers(): void {
   document.querySelector("#detach-event-btn")?.addEventListener("click", () => void deleteCurrentEvent("detach"));
   document.querySelector<HTMLSelectElement>("#event-place-select")?.addEventListener("change", syncSelectedPlaceIntoEventForm);
   document.querySelector("#open-map-from-event")?.addEventListener("click", () => {
-    state.modal = null;
-    state.editingEvent = null;
-    state.viewMode = "map";
-    render();
+    window.dispatchEvent(new CustomEvent("calendar:event-map-picker"));
   });
 
   document.querySelector<HTMLFormElement>("#smart-form")?.addEventListener("submit", (event) => void submitSmartParse(event));
