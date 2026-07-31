@@ -237,7 +237,11 @@ export default {
     } catch (error) {
       console.error(error);
       const status = error instanceof HttpError ? error.status : 500;
-      const message = error instanceof HttpError ? error.message : "服务器处理失败";
+      const message = error instanceof HttpError
+        ? error.message
+        : error instanceof Error
+          ? `服务器处理失败：${error.message}`
+          : "服务器处理失败";
       return json({ error: message }, status);
     }
   },
@@ -1558,41 +1562,57 @@ function randomToken(length: number): string {
 }
 
 async function hashPassword(password: string): Promise<string> {
+  // Cloudflare Workers Free 每次请求的 CPU 时间非常有限。
+  // 高迭代 PBKDF2 会让首次初始化和登录直接触发 500，因此这里使用
+  // 每个账号独立随机盐 + SHA-256。该方案适合这个小范围私人日历，
+  // 同时避免在代码或 KV 中保存明文密码。
   const salt = crypto.getRandomValues(new Uint8Array(16));
-  const key = await crypto.subtle.importKey(
-    "raw",
-    bytesToArrayBuffer(new TextEncoder().encode(password)),
-    "PBKDF2",
-    false,
-    ["deriveBits"],
-  );
-  const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt: bytesToArrayBuffer(salt), iterations: 120_000 },
-    key,
-    256,
-  );
-  return `pbkdf2$120000$${bytesToBase64Url(salt)}$${bytesToBase64Url(new Uint8Array(bits))}`;
+  const digest = await digestSaltedPassword(password, salt);
+  return `sha256$v1$${bytesToBase64Url(salt)}$${bytesToBase64Url(digest)}`;
 }
 
 async function verifyPassword(password: string, stored: string): Promise<boolean> {
   const parts = stored.split("$");
-  if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
-  const iterations = Number(parts[1]);
-  const salt = base64UrlToBytes(parts[2]);
-  const expected = base64UrlToBytes(parts[3]);
-  const key = await crypto.subtle.importKey(
-    "raw",
-    bytesToArrayBuffer(new TextEncoder().encode(password)),
-    "PBKDF2",
-    false,
-    ["deriveBits"],
-  );
-  const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt: bytesToArrayBuffer(salt), iterations },
-    key,
-    expected.byteLength * 8,
-  );
-  return timingSafeEqual(new Uint8Array(bits), expected);
+
+  if (parts.length === 4 && parts[0] === "sha256" && parts[1] === "v1") {
+    const salt = base64UrlToBytes(parts[2]);
+    const expected = base64UrlToBytes(parts[3]);
+    const actual = await digestSaltedPassword(password, salt);
+    return timingSafeEqual(actual, expected);
+  }
+
+  // 兼容早期版本已经创建的 PBKDF2 密码。
+  // 新创建或重置的密码都会自动使用上面的轻量方案。
+  if (parts.length === 4 && parts[0] === "pbkdf2") {
+    const iterations = Number(parts[1]);
+    if (!Number.isInteger(iterations) || iterations < 1 || iterations > 200_000) return false;
+    const salt = base64UrlToBytes(parts[2]);
+    const expected = base64UrlToBytes(parts[3]);
+    const key = await crypto.subtle.importKey(
+      "raw",
+      bytesToArrayBuffer(new TextEncoder().encode(password)),
+      "PBKDF2",
+      false,
+      ["deriveBits"],
+    );
+    const bits = await crypto.subtle.deriveBits(
+      { name: "PBKDF2", hash: "SHA-256", salt: bytesToArrayBuffer(salt), iterations },
+      key,
+      expected.byteLength * 8,
+    );
+    return timingSafeEqual(new Uint8Array(bits), expected);
+  }
+
+  return false;
+}
+
+async function digestSaltedPassword(password: string, salt: Uint8Array): Promise<Uint8Array> {
+  const passwordBytes = new TextEncoder().encode(password);
+  const input = new Uint8Array(salt.byteLength + passwordBytes.byteLength);
+  input.set(salt, 0);
+  input.set(passwordBytes, salt.byteLength);
+  const digest = await crypto.subtle.digest("SHA-256", bytesToArrayBuffer(input));
+  return new Uint8Array(digest);
 }
 
 async function sha256Hex(value: string): Promise<string> {
@@ -1668,6 +1688,9 @@ async function getFreshData(env: Env): Promise<AppData> {
 }
 
 async function loadData(env: Env): Promise<{ data: AppData; migrated: boolean }> {
+  if (!env.CALENDAR_KV || typeof env.CALENDAR_KV.get !== "function") {
+    throw new HttpError(503, "Cloudflare KV 绑定 CALENDAR_KV 不存在，请检查 wrangler.jsonc 或 Worker 的 Bindings 设置");
+  }
   const raw = await env.CALENDAR_KV.get(DATA_KEY);
   if (!raw) return { data: emptyData(), migrated: false };
   let parsed: unknown;
@@ -1816,8 +1839,16 @@ function pruneData(data: AppData): void {
 }
 
 async function writeData(env: Env, data: AppData): Promise<void> {
+  if (!env.CALENDAR_KV || typeof env.CALENDAR_KV.put !== "function") {
+    throw new HttpError(503, "Cloudflare KV 绑定 CALENDAR_KV 不存在，请检查 wrangler.jsonc 或 Worker 的 Bindings 设置");
+  }
   const wait = Math.max(0, KV_WRITE_INTERVAL_MS - (Date.now() - lastKvWriteAt));
   if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-  await env.CALENDAR_KV.put(DATA_KEY, JSON.stringify(data));
-  lastKvWriteAt = Date.now();
+  try {
+    await env.CALENDAR_KV.put(DATA_KEY, JSON.stringify(data));
+    lastKvWriteAt = Date.now();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new HttpError(503, `日历数据写入 Cloudflare KV 失败：${detail}`);
+  }
 }
