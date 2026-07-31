@@ -1,0 +1,17 @@
+{
+  "name": "shared-space-calendar",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:client": "tsc -p tsconfig.client.json",
+    "typecheck": "tsc -p tsconfig.check.json --noEmit",
+    "build": "npm run build:client && npm run typecheck",
+    "dev": "npm run build:client && wrangler dev",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "wrangler": "4.116.0"
+  }
+}
