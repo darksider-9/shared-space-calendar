@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "3.1.0";
+  const VERSION = "3.2.0";
   const API = "/api";
   const DEFAULT_CENTER = [31.2989, 120.5853];
   const nativeFetch = window.fetch.bind(window);
@@ -12,6 +12,7 @@
     membersBySpace: new Map(),
     eventsBySpace: new Map(),
     placesBySpace: new Map(),
+    activitiesBySpace: new Map(),
     revisionBySpace: new Map(),
   };
 
@@ -32,6 +33,7 @@
     pickerMarker: null,
     plannerResult: null,
     plannerEvents: [],
+    smartPendingPlace: null,
     refreshToken: 0,
   };
 
@@ -109,7 +111,12 @@
           const payload = bodyToObject(init.body);
           if (payload) {
             const activeSpaceId = getActiveSpaceId();
-            const formState = readEventEnhancementForm();
+            const isSmartSubmission = !document.querySelector("#event-form")
+              && Boolean(document.querySelector("#smart-form"))
+              && (payload.source === "rules" || payload.source === "ai");
+            const formState = isSmartSubmission
+              ? { selectedPlaceId: null, pendingPlace: ui.smartPendingPlace, spaceIds: Array.isArray(payload.spaceIds) ? payload.spaceIds : [], deleteMode: "detach" }
+              : readEventEnhancementForm();
             if (activeSpaceId) payload.currentSpaceId = activeSpaceId;
             if (formState.spaceIds.length) payload.spaceIds = formState.spaceIds;
 
@@ -172,6 +179,9 @@
     }
 
     const response = await nativeFetch(nextInput, nextInit);
+    if (response.ok && url && method === "POST" && /^\/api\/spaces\/[^/]+\/events$/.test(url.pathname) && ui.smartPendingPlace) {
+      ui.smartPendingPlace = null;
+    }
     if (url && url.origin === location.origin && url.pathname.startsWith("/api/") && response.ok) {
       void response.clone().json().then((payload) => absorbApiResponse(url, method, payload)).catch(() => undefined);
     }
@@ -196,6 +206,10 @@
     const placesMatch = url.pathname.match(/^\/api\/spaces\/([^/]+)\/places$/);
     if (placesMatch && method === "GET" && Array.isArray(payload.places)) {
       cache.placesBySpace.set(placesMatch[1], payload.places);
+    }
+    const activitiesMatch = url.pathname.match(/^\/api\/spaces\/([^/]+)\/activities$/);
+    if (activitiesMatch && method === "GET" && Array.isArray(payload.activities)) {
+      cache.activitiesBySpace.set(activitiesMatch[1], payload.activities);
     }
   }
 
@@ -251,7 +265,7 @@
       const payload = await requestJsonNative(`${API}/spaces/${spaceId}`);
       cache.membersBySpace.set(spaceId, payload.members || []);
     }
-    await loadPlaces(spaceId, force);
+    await Promise.all([loadPlaces(spaceId, force), loadActivities(spaceId, force)]);
   }
 
   async function loadPlaces(spaceId, force = false) {
@@ -261,6 +275,15 @@
     const places = payload.places || [];
     cache.placesBySpace.set(spaceId, places);
     return places;
+  }
+
+  async function loadActivities(spaceId, force = false) {
+    if (!spaceId) return [];
+    if (!force && cache.activitiesBySpace.has(spaceId)) return cache.activitiesBySpace.get(spaceId) || [];
+    const payload = await requestJsonNative(`${API}/spaces/${spaceId}/activities`);
+    const activities = payload.activities || [];
+    cache.activitiesBySpace.set(spaceId, activities);
+    return activities;
   }
 
   async function loadEventsForRange(spaceId, start, end) {
@@ -286,6 +309,7 @@
       resetEventEnhancement(false);
     }
     if (target.closest("#new-event-btn, #day-add-event, #detail-add-event")) resetEventEnhancement(true);
+    if (target.closest("#smart-add-btn")) ui.smartPendingPlace = null;
   }, true);
 
   const observer = new MutationObserver(() => enhanceCurrentDom());
@@ -294,8 +318,18 @@
   window.addEventListener("load", enhanceCurrentDom);
 
   function enhanceCurrentDom() {
+    suppressNativeMapUi();
     injectPlannerEntry();
     injectEventEnhancements();
+    injectSmartEnhancements();
+  }
+
+  function suppressNativeMapUi() {
+    document.querySelectorAll('[data-view="map"], #planner-view-btn').forEach((element) => element.remove());
+    const nativeMap = document.querySelector("#shared-map");
+    if (nativeMap && !document.querySelector("#planner-enhancement-overlay")) {
+      document.querySelector('[data-view="month"]')?.click();
+    }
   }
 
   function injectPlannerEntry() {
@@ -312,21 +346,16 @@
       commandbar.appendChild(button);
     }
 
-    const viewTabs = document.querySelector(".view-tabs");
-    if (viewTabs && !viewTabs.querySelector("#planner-view-btn")) {
-      const button = document.createElement("button");
-      button.id = "planner-view-btn";
-      button.type = "button";
-      button.textContent = "地图规划";
-      button.addEventListener("click", () => void openPlanner("map"));
-      viewTabs.appendChild(button);
-    }
   }
 
   function injectEventEnhancements() {
     const form = document.querySelector("#event-form");
     if (!form || form.querySelector("#event-map-sync-fields")) return;
     const activeSpaceId = getActiveSpaceId();
+    if (form.querySelector(".place-event-block") || form.querySelector(".sync-space-block")) {
+      enhanceNativeEventForm(form, activeSpaceId);
+      return;
+    }
     if (!activeSpaceId) return;
 
     const cachedEvent = eventEnhancement.eventId
@@ -365,6 +394,83 @@
     void ensureBootstrap().then(() => ensureSpaceData(activeSpaceId)).then(() => refreshEventEnhancementSection(activeSpaceId, cachedEvent)).catch(() => undefined);
   }
 
+  function enhanceNativeEventForm(form, activeSpaceId) {
+    if (!activeSpaceId || form.dataset.mapPlannerEnhanced === "1") return;
+    form.dataset.mapPlannerEnhanced = "1";
+    const select = form.querySelector('#event-place-select, select[name="placeId"]');
+    const currentValue = select?.value || "";
+    eventEnhancement.selectedPlaceId = currentValue || null;
+    const existingButton = form.querySelector("#open-map-from-event");
+    if (existingButton) {
+      const button = existingButton.cloneNode(true);
+      button.textContent = "在地图上标点";
+      button.title = "直接点击地图选择位置，不进入另一张共享地图";
+      existingButton.replaceWith(button);
+      button.addEventListener("click", () => {
+        const locationInput = form.querySelector('input[name="location"]');
+        const latInput = form.querySelector('input[name="latitude"]');
+        const lonInput = form.querySelector('input[name="longitude"]');
+        const addressInput = form.querySelector('input[name="placeAddress"]');
+        const latitude = Number(latInput?.value);
+        const longitude = Number(lonInput?.value);
+        void openMapPicker({
+          title: "为这条日程直接标点",
+          initialName: locationInput?.value || "",
+          initialPlace: Number.isFinite(latitude) && Number.isFinite(longitude) && latInput?.value && lonInput?.value
+            ? { latitude, longitude, name: locationInput?.value || "地图标记点", address: addressInput?.value || "" }
+            : null,
+          onConfirm: (place) => {
+            eventEnhancement.selectedPlaceId = null;
+            eventEnhancement.pendingPlace = place;
+            if (select) select.value = "";
+            if (locationInput) locationInput.value = place.name;
+            if (addressInput) addressInput.value = place.address || "";
+            if (latInput) latInput.value = String(place.latitude);
+            if (lonInput) lonInput.value = String(place.longitude);
+          },
+        });
+      });
+    }
+    select?.addEventListener("change", () => {
+      eventEnhancement.selectedPlaceId = select.value || null;
+      if (select.value) eventEnhancement.pendingPlace = null;
+    });
+  }
+
+  function injectSmartEnhancements() {
+    const draftCard = document.querySelector(".draft-card");
+    if (!draftCard || draftCard.querySelector("#smart-pick-map")) return;
+    const actions = draftCard.querySelector(".inline-actions") || draftCard;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.id = "smart-pick-map";
+    button.className = "secondary-btn smart-pick-map";
+    button.innerHTML = `${icon("pin")} 地图直接标点`;
+    button.addEventListener("click", () => {
+      const initialName = readDraftLocationText();
+      void openMapPicker({
+        title: "为智能日程确认地点",
+        initialName: initialName === "未填写" ? "" : initialName,
+        initialPlace: ui.smartPendingPlace,
+        onConfirm: (place) => {
+          ui.smartPendingPlace = place;
+          const note = draftCard.querySelector("#smart-picked-place-note") || document.createElement("div");
+          note.id = "smart-picked-place-note";
+          note.className = "smart-picked-place-note";
+          note.textContent = `已标点：${place.name} · ${place.latitude.toFixed(5)}, ${place.longitude.toFixed(5)}`;
+          if (!note.parentElement) draftCard.insertBefore(note, actions);
+        },
+      });
+    });
+    actions.prepend(button);
+  }
+
+  function readDraftLocationText() {
+    const terms = Array.from(document.querySelectorAll(".draft-card dt"));
+    const locationTerm = terms.find((term) => term.textContent?.trim() === "地点");
+    return locationTerm?.nextElementSibling?.textContent?.trim().split("\n")[0] || "";
+  }
+
   function renderEventEnhancementSection(activeSpaceId, cachedEvent) {
     const spaces = cache.spaces.length ? cache.spaces : [{ id: activeSpaceId, name: "当前空间", icon: "◫" }];
     const canChangeSpaces = !cachedEvent || cachedEvent.createdBy === cache.me?.id;
@@ -382,7 +488,7 @@
         <div class="event-place-row">
           <select class="field" id="event-place-select">
             <option value="">不关联地点库</option>
-            ${(cache.placesBySpace.get(activeSpaceId) || []).filter((place) => !isActivityRecord(place)).map((place) => `<option value="${escapeAttr(place.id)}" ${place.id === eventEnhancement.selectedPlaceId ? "selected" : ""}>${escapeHtml(place.name)}${place.status ? ` · ${placeStatusLabel(place.status)}` : ""}</option>`).join("")}
+            ${(cache.placesBySpace.get(activeSpaceId) || []).map((place) => `<option value="${escapeAttr(place.id)}" ${place.id === eventEnhancement.selectedPlaceId ? "selected" : ""}>${escapeHtml(place.name)}${place.status ? ` · ${placeStatusLabel(place.status)}` : ""}</option>`).join("")}
           </select>
           <div class="selected-location-summary" id="event-location-summary">${escapeHtml(placeLabel)}</div>
           <button type="button" class="ghost-btn" id="event-clear-place">清除标点</button>
@@ -474,12 +580,22 @@
 
   function readEventEnhancementForm() {
     const section = document.querySelector("#event-map-sync-fields");
+    const nativeForm = document.querySelector("#event-form");
     if (section) {
       const activeSpaceId = getActiveSpaceId();
       eventEnhancement.selectedSpaceIds = Array.from(section.querySelectorAll("[data-sync-space]:checked")).map((item) => item.getAttribute("data-sync-space")).filter(Boolean);
       if (activeSpaceId && !eventEnhancement.selectedSpaceIds.includes(activeSpaceId)) eventEnhancement.selectedSpaceIds.unshift(activeSpaceId);
       const mode = section.querySelector("#event-delete-mode")?.value;
       eventEnhancement.deleteMode = mode === "all" ? "all" : "detach";
+    } else if (nativeForm) {
+      const activeSpaceId = getActiveSpaceId();
+      eventEnhancement.selectedSpaceIds = Array.from(nativeForm.querySelectorAll('input[name="spaceIds"]:checked')).map((item) => item.value).filter(Boolean);
+      if (activeSpaceId && !eventEnhancement.selectedSpaceIds.includes(activeSpaceId)) eventEnhancement.selectedSpaceIds.unshift(activeSpaceId);
+      const select = nativeForm.querySelector('#event-place-select, select[name="placeId"]');
+      if (select?.value) {
+        eventEnhancement.selectedPlaceId = select.value;
+        eventEnhancement.pendingPlace = null;
+      }
     }
     return {
       selectedPlaceId: eventEnhancement.selectedPlaceId,
@@ -542,15 +658,11 @@
   }
 
   function placeRecords(spaceId = getActiveSpaceId()) {
-    return (cache.placesBySpace.get(spaceId) || []).filter((place) => !isActivityRecord(place));
+    return cache.placesBySpace.get(spaceId) || [];
   }
 
   function activityRecords(spaceId = getActiveSpaceId()) {
-    return (cache.placesBySpace.get(spaceId) || []).filter(isActivityRecord);
-  }
-
-  function isActivityRecord(place) {
-    return String(place.category || "").startsWith("活动库:");
+    return cache.activitiesBySpace.get(spaceId) || [];
   }
 
   function renderMapTab() {
@@ -784,12 +896,12 @@
   }
 
   function renderActivityGrid(records, query = "", category = "全部") {
-    const byTitle = new Map(records.map((record) => [record.name, record]));
+    const byTitle = new Map(records.map((record) => [record.title, record]));
     const items = ACTIVITY_LIBRARY.filter((item) => (!query || `${item.title}${item.category}${item.tag}`.includes(query)) && (category === "全部" || item.category === category));
-    const custom = records.filter((record) => !ACTIVITY_LIBRARY.some((item) => item.title === record.name) && (!query || `${record.name}${record.notes || ""}`.includes(query)) && (category === "全部" || String(record.category).slice(4) === category));
+    const custom = records.filter((record) => !ACTIVITY_LIBRARY.some((item) => item.title === record.title) && (!query || `${record.title}${record.notes || ""}`.includes(query)) && (category === "全部" || record.category === category));
     const cards = [
       ...items.map((item) => ({ title: item.title, category: item.category, tag: item.tag, record: byTitle.get(item.title) || null })),
-      ...custom.map((record) => ({ title: record.name, category: String(record.category).replace(/^活动库:/, "") || "自定义", tag: "空间自定义", record })),
+      ...custom.map((record) => ({ title: record.title, category: record.category || "自定义", tag: record.tag || "空间自定义", record })),
     ];
     if (!cards.length) return `<div class="planner-empty"><strong>没有匹配的活动</strong><p>换一个关键词，或添加自定义活动。</p></div>`;
     return cards.map((item) => `
@@ -829,15 +941,15 @@
     }));
   }
 
-  async function addActivityToSpace(title, category) {
+  async function addActivityToSpace(title, category, tag = "") {
     if (!title) return;
-    if (activityRecords().some((record) => record.name === title)) return showToast("已经在空间活动库中");
+    if (activityRecords().some((record) => record.title === title)) return showToast("已经在空间活动库中");
     try {
-      await requestJsonNative(`${API}/spaces/${getActiveSpaceId()}/places`, {
+      await requestJsonNative(`${API}/spaces/${getActiveSpaceId()}/activities`, {
         method: "POST",
-        body: { name: title, address: "", latitude: null, longitude: null, category: `活动库:${category || "其他"}`, status: "wishlist", notes: "空间活动库" },
+        body: { title, category: category || "其他", tag, notes: "" },
       });
-      await loadPlaces(getActiveSpaceId(), true);
+      await loadActivities(getActiveSpaceId(), true);
       showToast("已加入空间活动库");
       renderPlannerOverlay();
     } catch (error) { showToast(error.message, true); }
@@ -852,8 +964,8 @@
 
   async function toggleActivityLike(id) {
     try {
-      await requestJsonNative(`${API}/places/${id}/like?spaceId=${encodeURIComponent(getActiveSpaceId())}`, { method: "POST", body: {} });
-      await loadPlaces(getActiveSpaceId(), true);
+      await requestJsonNative(`${API}/activities/${id}/like`, { method: "POST", body: {} });
+      await loadActivities(getActiveSpaceId(), true);
       renderPlannerOverlay();
     } catch (error) { showToast(error.message, true); }
   }
@@ -872,13 +984,14 @@
     return `
       <section class="random-layout">
         <div class="random-config">
-          <div class="planner-section-head"><div><h3>随机生成一次共同计划</h3><p>先用规则计算成员共同空闲，再随机组合日期、地点和要做的事。无需 AI。</p></div><span class="algorithm-badge">规则规划</span></div>
+          <div class="planner-section-head"><div><h3>生成一次共同计划</h3><p>先计算共同空闲，再结合地点、活动投票和过往偏好。配置 AI 时由 AI 优化选择，未配置时使用规则权重规划。</p></div><span class="algorithm-badge">${getActiveSpace()?.hasAI ? "AI + 规则" : "规则规划"}</span></div>
           <div class="random-form-grid">
             <fieldset><legend>参与成员</legend><div class="planner-member-grid">${members.map((member) => `<label style="--member:${member.color}"><input type="checkbox" data-plan-member="${escapeAttr(member.id)}" ${member.isMe || admin ? "checked" : ""} ${!admin && !member.isMe ? "disabled" : ""}/><i></i><span>${escapeHtml(member.displayName)}</span></label>`).join("")}</div>${!admin ? `<small>普通成员只能直接给自己创建；邀请其他成员仍需对方确认。</small>` : ""}</fieldset>
             <fieldset><legend>日期范围</legend><div class="two-fields"><label>开始<input class="field" type="date" id="plan-start-date" value="${start}"/></label><label>结束<input class="field" type="date" id="plan-end-date" value="${end}"/></label></div></fieldset>
             <fieldset><legend>时间偏好</legend><div class="two-fields"><label>时段<select class="field" id="plan-period"><option value="morning">上午 09:00—12:00</option><option value="afternoon" selected>下午 13:00—18:00</option><option value="evening">晚上 18:00—23:00</option><option value="day">白天 09:00—18:00</option></select></label><label>需要时长<select class="field" id="plan-duration"><option value="60">1小时</option><option value="120" selected>2小时</option><option value="180">3小时</option><option value="240">4小时</option><option value="360">6小时</option></select></label></div></fieldset>
             <fieldset><legend>地点池</legend><select class="field" id="plan-place-pool"><option value="wishlist">优先想去地点</option><option value="all">全部地点</option><option value="visited">去过的地点</option><option value="planned">已经计划的地点</option><option value="none">不指定地点</option></select><select class="field" id="plan-place-fixed"><option value="">随机选择</option>${placeRecords().map((place) => `<option value="${escapeAttr(place.id)}" ${place.id === presetPlaceId ? "selected" : ""}>${escapeHtml(place.name)} · ${placeStatusLabel(place.status)}</option>`).join("")}</select></fieldset>
-            <fieldset><legend>活动池</legend><select class="field" id="plan-activity-pool"><option value="liked">优先大家点赞的活动</option><option value="space">空间活动库</option><option value="builtin">全部 99 件事情</option><option value="none">只安排地点</option></select><select class="field" id="plan-activity-fixed"><option value="">随机选择</option>${activityRecords().map((activity) => `<option value="${escapeAttr(activity.id)}" ${activity.id === presetActivityId ? "selected" : ""}>${escapeHtml(activity.name)} · ♥${activity.likeCount || 0}</option>`).join("")}</select></fieldset>
+            <fieldset><legend>活动池</legend><select class="field" id="plan-activity-pool"><option value="liked">优先大家点赞的活动</option><option value="space">空间活动库</option><option value="builtin">全部 99 件事情</option><option value="none">只安排地点</option></select><select class="field" id="plan-activity-fixed"><option value="">随机选择</option>${activityRecords().map((activity) => `<option value="${escapeAttr(activity.id)}" ${activity.id === presetActivityId ? "selected" : ""}>${escapeHtml(activity.title)} · ♥${activity.likeCount || 0}</option>`).join("")}</select></fieldset>
+            <fieldset class="full-fieldset"><legend>这次有什么偏好（可不填）</legend><input class="field" id="plan-preference" maxlength="240" placeholder="例如：不要太累、想在室内、预算低一点、最好有点新鲜感"/></fieldset>
             <fieldset class="full-fieldset"><legend>同步到空间</legend><div class="sync-space-grid">${spaces.map((space) => `<label class="sync-space-option"><input type="checkbox" data-plan-space="${escapeAttr(space.id)}" ${space.id === activeSpaceId ? "checked disabled" : ""}/><span>${escapeHtml(space.icon || "◫")} ${escapeHtml(space.name)}</span>${space.id === activeSpaceId ? `<small>当前空间</small>` : ""}</label>`).join("")}</div></fieldset>
           </div>
           <button class="roulette-button" id="run-random-plan">${icon("dice")}<span><strong>转一下</strong><small>找共同空闲并随机组合</small></span></button>
@@ -904,15 +1017,16 @@
   function renderRandomResult(result) {
     if (!result) return `<div class="roulette-empty"><span>${icon("dice")}</span><strong>等待转出一个计划</strong><p>系统会避开所选成员已有日程，组合一个共同空闲时间、地点和活动。</p></div>`;
     return `
-      <div class="result-label">本次随机计划</div>
+      <div class="result-label">${result.mode === "ai" ? "AI 推荐计划" : "规则推荐计划"}</div>
       <div class="result-date"><span>${escapeHtml(formatDateZh(result.date))}</span><strong>${escapeHtml(result.startTime)}—${escapeHtml(result.endTime)}</strong><button id="reroll-date" title="只换日期">↻</button></div>
       <div class="result-combination">
         <article><small>去哪里</small><strong>${escapeHtml(result.place?.name || "地点待定")}</strong><span>${escapeHtml(result.place?.address || (result.place ? placeStatusLabel(result.place.status) : "可稍后补充"))}</span><button id="reroll-place">换一个地点</button></article>
         <div class="plus-sign">＋</div>
-        <article><small>做什么</small><strong>${escapeHtml(result.activity?.name || result.activity?.title || "自由活动")}</strong><span>${escapeHtml(result.activity ? activityCategory(result.activity) : "随意安排")}</span><button id="reroll-activity">换一件事情</button></article>
+        <article><small>做什么</small><strong>${escapeHtml(result.activity?.title || "自由活动")}</strong><span>${escapeHtml(result.activity ? activityCategory(result.activity) : "随意安排")}</span><button id="reroll-activity">换一件事情</button></article>
       </div>
       <div class="result-members">参与：${escapeHtml(result.memberNames.join("、"))}</div>
       <div class="result-title-preview">将创建：<strong>${escapeHtml(result.title)}</strong></div>
+      ${result.reason ? `<div class="result-reason">${escapeHtml(result.reason)}</div>` : ""}
       <button class="primary-btn wide" id="confirm-random-plan">确认创建并同步到日历</button>`;
   }
 
@@ -934,14 +1048,54 @@
       const events = await loadEventsForRange(spaceId, start, end);
       const slots = findCommonFreeSlots(start, end, period, duration, memberIds, events);
       if (!slots.length) throw new Error("这个范围内没有找到共同空闲时段，请扩大日期范围或缩短时长");
-      const slot = randomChoice(slots);
-      const place = options.keepPlace && ui.plannerResult?.place ? ui.plannerResult.place : choosePlannerPlace();
-      const activity = options.keepActivity && ui.plannerResult?.activity ? ui.plannerResult.activity : choosePlannerActivity();
+
+      let placeCandidates = plannerPlaceCandidates();
+      let activityCandidates = plannerActivityCandidates();
+      if (options.keepPlace && ui.plannerResult?.place) placeCandidates = [ui.plannerResult.place];
+      if (options.keepActivity && ui.plannerResult?.activity) activityCandidates = [ui.plannerResult.activity];
+      const preference = document.querySelector("#plan-preference")?.value?.trim() || "";
+
+      let recommended = null;
+      try {
+        const payload = await requestJsonNative(`${API}/spaces/${spaceId}/planner/recommend`, {
+          method: "POST",
+          body: {
+            memberIds,
+            slots: slots.slice(0, 60),
+            placeIds: placeCandidates.map((place) => place.id).filter(Boolean),
+            activities: activityCandidates.map((activity) => ({
+              id: activity.id,
+              title: activity.title,
+              category: activity.category,
+              tag: activity.tag || "",
+              builtin: Boolean(activity.builtin),
+            })),
+            preference,
+          },
+        });
+        recommended = payload.recommendation || null;
+      } catch (error) {
+        console.warn("planner recommendation fallback", error);
+      }
+
+      const slot = recommended?.slot || randomChoice(slots);
+      const place = recommended ? recommended.place : weightedRandom(placeCandidates, (item) => 1 + (item.likeCount || 0) * 2);
+      const activity = recommended ? recommended.activity : weightedRandom(activityCandidates, (item) => 1 + (item.likeCount || 0) * 2);
       const selectedSpaces = Array.from(document.querySelectorAll("[data-plan-space]:checked")).map((item) => item.getAttribute("data-plan-space")).filter(Boolean);
       if (!selectedSpaces.includes(spaceId)) selectedSpaces.unshift(spaceId);
       const memberNames = memberIds.map((id) => members.find((member) => member.id === id)?.displayName).filter(Boolean);
-      const title = buildPlannerTitle(place, activity);
-      ui.plannerResult = { ...slot, place, activity, title, memberIds, memberNames, spaceIds: selectedSpaces };
+      const title = recommended?.title || buildPlannerTitle(place, activity);
+      ui.plannerResult = {
+        ...slot,
+        place: place || null,
+        activity: activity || null,
+        title,
+        reason: recommended?.reason || "已避开成员现有日程，并按空间投票权重选择地点和活动。",
+        mode: recommended?.mode || "rules",
+        memberIds,
+        memberNames,
+        spaceIds: selectedSpaces,
+      };
       const resultRoot = document.querySelector("#random-result");
       if (resultRoot) {
         resultRoot.classList.add("is-spinning");
@@ -958,31 +1112,37 @@
     }
   }
 
-  function choosePlannerPlace() {
+  function plannerPlaceCandidates() {
     const fixed = document.querySelector("#plan-place-fixed")?.value;
-    if (fixed) return placeRecords().find((place) => place.id === fixed) || null;
+    if (fixed) return placeRecords().filter((place) => place.id === fixed);
     const pool = document.querySelector("#plan-place-pool")?.value || "wishlist";
-    if (pool === "none") return null;
+    if (pool === "none") return [];
     let candidates = placeRecords();
     if (pool !== "all") candidates = candidates.filter((place) => place.status === pool);
     if (!candidates.length && pool === "wishlist") candidates = placeRecords();
-    return weightedRandom(candidates, (place) => 1 + (place.likeCount || 0) * 2);
+    return candidates;
+  }
+
+  function plannerActivityCandidates() {
+    const fixed = document.querySelector("#plan-activity-fixed")?.value;
+    if (fixed) return activityRecords().filter((item) => item.id === fixed);
+    const pool = document.querySelector("#plan-activity-pool")?.value || "liked";
+    if (pool === "none") return [];
+    const records = activityRecords();
+    if (pool === "space") return records;
+    if (pool === "liked") {
+      const voted = records.filter((item) => (item.likeCount || 0) > 0);
+      return voted.length ? voted : records;
+    }
+    return ACTIVITY_LIBRARY.map((item) => ({ ...item, builtin: true }));
+  }
+
+  function choosePlannerPlace() {
+    return weightedRandom(plannerPlaceCandidates(), (place) => 1 + (place.likeCount || 0) * 2);
   }
 
   function choosePlannerActivity() {
-    const fixed = document.querySelector("#plan-activity-fixed")?.value;
-    if (fixed) return activityRecords().find((item) => item.id === fixed) || null;
-    const pool = document.querySelector("#plan-activity-pool")?.value || "liked";
-    if (pool === "none") return null;
-    const records = activityRecords();
-    if (pool === "space") return weightedRandom(records, (item) => 1 + (item.likeCount || 0));
-    if (pool === "liked") {
-      const voted = records.filter((item) => (item.likeCount || 0) > 0);
-      if (voted.length) return weightedRandom(voted, (item) => 1 + (item.likeCount || 0) * 3);
-      if (records.length) return randomChoice(records);
-    }
-    const builtin = randomChoice(ACTIVITY_LIBRARY);
-    return builtin ? { id: builtin.id, name: builtin.title, category: `活动库:${builtin.category}`, notes: builtin.tag, builtin: true } : null;
+    return weightedRandom(plannerActivityCandidates(), (activity) => 1 + (activity.likeCount || 0) * 3);
   }
 
   function rerollPart(part) {
@@ -1015,9 +1175,9 @@
         latitude: result.place?.latitude ?? null,
         longitude: result.place?.longitude ?? null,
         companions: "",
-        notes: result.activity ? `随机规划活动：${result.activity.name || result.activity.title}` : "由随机规划生成",
+        notes: result.activity ? `随机规划活动：${result.activity.title}` : "由随机规划生成",
         assignedUserIds: result.memberIds,
-        source: "rules",
+        source: result.mode === "ai" ? "ai" : "rules",
         spaceIds: result.spaceIds,
       };
       await requestJsonNative(`${API}/spaces/${spaceId}/events`, { method: "POST", body: payload });
@@ -1187,14 +1347,14 @@
   }
 
   function buildPlannerTitle(place, activity) {
-    const activityName = activity?.name || activity?.title || "自由活动";
+    const activityName = activity?.title || "自由活动";
     if (place && activity) return `${place.name} · ${activityName}`;
     if (place) return `去${place.name}`;
     return activityName;
   }
 
   function activityCategory(activity) {
-    return String(activity.category || "活动").replace(/^活动库:/, "");
+    return String(activity.category || "活动");
   }
 
   function weightedRandom(items, weightFn) {
