@@ -1,153 +1,300 @@
-"use strict";
-const appRoot = document.querySelector("#app");
-if (!appRoot)
-    throw new Error("Missing #app");
-const app = appRoot;
-const today = new Date();
-const state = {
-    loading: true,
-    needsSetup: false,
-    authMode: "login",
-    me: null,
-    spaces: [],
-    activeSpaceId: null,
-    activeSpace: null,
-    members: [],
-    events: [],
-    invitations: [],
-    manageInvitations: [],
-    joinRequests: [],
-    ai: null,
-    platformUsers: [],
-    viewYear: today.getFullYear(),
-    viewMonth: today.getMonth() + 1,
-    selectedDate: localDateString(today),
-    viewMode: "month",
-    visibleMemberIds: new Set(),
-    modal: null,
-    manageTab: "members",
-    editingEvent: null,
-    draft: null,
-    error: null,
-    revision: 0,
+type SpaceRole = "owner" | "admin" | "member";
+type ViewMode = "month" | "day";
+type ModalName =
+  | "event"
+  | "smart"
+  | "dayDetail"
+  | "createSpace"
+  | "joinSpace"
+  | "notifications"
+  | "spaceManage"
+  | "platformAdmin"
+  | null;
+
+type User = {
+  id: string;
+  username: string;
+  displayName: string;
+  isPlatformAdmin: boolean;
 };
-let pollTimer = null;
+
+type Space = {
+  id: string;
+  name: string;
+  description: string;
+  icon: string;
+  role: SpaceRole;
+  color: string;
+  memberCount: number;
+  allowMemberInvites: boolean;
+  inviteCode?: string;
+  hasAI: boolean;
+  createdAt: string;
+};
+
+type Member = {
+  id: string;
+  username: string;
+  displayName: string;
+  role: SpaceRole;
+  color: string;
+  joinedAt: string;
+  isMe: boolean;
+};
+
+type CalendarEvent = {
+  id: string;
+  spaceId: string;
+  title: string;
+  startDate: string;
+  startTime: string | null;
+  endTime: string | null;
+  allDay: boolean;
+  location: string;
+  companions: string;
+  notes: string;
+  createdBy: string;
+  assignedUserIds: string[];
+  source: "manual" | "rules" | "ai";
+  createdAt: string;
+  updatedAt: string;
+};
+
+type Invitation = {
+  id: string;
+  spaceId: string;
+  spaceName: string;
+  inviterName: string;
+  createdAt: string;
+};
+
+type ManageInvitation = {
+  id: string;
+  inviteeName: string;
+  inviteeUsername: string;
+  inviterName: string;
+  status: string;
+  createdAt: string;
+};
+
+type JoinRequest = {
+  id: string;
+  userId: string;
+  displayName: string;
+  username: string;
+  status: string;
+  createdAt: string;
+};
+
+type AISettings = {
+  enabled: boolean;
+  endpoint: string;
+  model: string;
+  hasKey: boolean;
+  canManage: boolean;
+};
+
+type EventDraft = {
+  title: string;
+  date: string;
+  startTime: string | null;
+  endTime: string | null;
+  allDay: boolean;
+  location: string;
+  companions: string;
+  notes: string;
+  assignedUserIds: string[];
+  source: "rules" | "ai";
+  explanation: string;
+};
+
+type PlatformUser = {
+  id: string;
+  username: string;
+  displayName: string;
+  isPlatformAdmin: boolean;
+  disabled: boolean;
+  createdAt: string;
+  spaces: number;
+};
+
+type State = {
+  loading: boolean;
+  needsSetup: boolean;
+  authMode: "login" | "register";
+  me: User | null;
+  spaces: Space[];
+  activeSpaceId: string | null;
+  activeSpace: Space | null;
+  members: Member[];
+  events: CalendarEvent[];
+  invitations: Invitation[];
+  manageInvitations: ManageInvitation[];
+  joinRequests: JoinRequest[];
+  ai: AISettings | null;
+  platformUsers: PlatformUser[];
+  viewYear: number;
+  viewMonth: number;
+  selectedDate: string;
+  viewMode: ViewMode;
+  visibleMemberIds: Set<string>;
+  modal: ModalName;
+  manageTab: "members" | "invite" | "settings" | "ai";
+  editingEvent: CalendarEvent | null;
+  draft: EventDraft | null;
+  error: string | null;
+  revision: number;
+};
+
+const appRoot = document.querySelector<HTMLDivElement>("#app");
+if (!appRoot) throw new Error("Missing #app");
+const app = appRoot;
+
+const today = new Date();
+const state: State = {
+  loading: true,
+  needsSetup: false,
+  authMode: "login",
+  me: null,
+  spaces: [],
+  activeSpaceId: null,
+  activeSpace: null,
+  members: [],
+  events: [],
+  invitations: [],
+  manageInvitations: [],
+  joinRequests: [],
+  ai: null,
+  platformUsers: [],
+  viewYear: today.getFullYear(),
+  viewMonth: today.getMonth() + 1,
+  selectedDate: localDateString(today),
+  viewMode: "month",
+  visibleMemberIds: new Set<string>(),
+  modal: null,
+  manageTab: "members",
+  editingEvent: null,
+  draft: null,
+  error: null,
+  revision: 0,
+};
+
+let pollTimer: number | null = null;
 void bootstrap();
+
 window.addEventListener("focus", () => {
-    if (state.me && state.activeSpaceId && !state.modal)
-        void refreshQuietly();
+  if (state.me && state.activeSpaceId && !state.modal) void refreshQuietly();
 });
 document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && state.me && state.activeSpaceId && !state.modal)
-        void refreshQuietly();
+  if (!document.hidden && state.me && state.activeSpaceId && !state.modal) void refreshQuietly();
 });
-async function bootstrap() {
-    registerServiceWorker();
-    renderLoading();
-    try {
-        const setup = await api("/api/setup/status", { authOptional: true });
-        state.needsSetup = setup.needsSetup;
-        if (!state.needsSetup) {
-            try {
-                const me = await api("/api/me");
-                state.me = me.user;
-                await loadBootstrap();
-            }
-            catch (error) {
-                if (!isUnauthorized(error))
-                    throw error;
-            }
-        }
+
+async function bootstrap(): Promise<void> {
+  registerServiceWorker();
+  renderLoading();
+  try {
+    const setup = await api<{ needsSetup: boolean }>("/api/setup/status", { authOptional: true });
+    state.needsSetup = setup.needsSetup;
+    if (!state.needsSetup) {
+      try {
+        const me = await api<{ user: User }>("/api/me");
+        state.me = me.user;
+        await loadBootstrap();
+      } catch (error) {
+        if (!isUnauthorized(error)) throw error;
+      }
     }
-    catch (error) {
-        state.error = errorMessage(error);
-    }
-    finally {
-        state.loading = false;
-        render();
-    }
+  } catch (error) {
+    state.error = errorMessage(error);
+  } finally {
+    state.loading = false;
+    render();
+  }
 }
-async function loadBootstrap(preferredSpaceId) {
-    const data = await api("/api/bootstrap");
-    state.me = data.user;
-    state.spaces = data.spaces;
-    state.invitations = data.invitations;
-    const saved = preferredSpaceId ?? localStorage.getItem("activeSpaceId");
-    const target = data.spaces.find((space) => space.id === saved)?.id ?? data.spaces[0]?.id ?? null;
-    state.activeSpaceId = target;
-    if (target) {
-        localStorage.setItem("activeSpaceId", target);
-        await loadSpace(target);
-    }
-    else {
-        state.activeSpace = null;
-        state.members = [];
-        state.events = [];
-    }
-    startPolling();
+
+async function loadBootstrap(preferredSpaceId?: string): Promise<void> {
+  const data = await api<{ user: User; spaces: Space[]; invitations: Invitation[] }>("/api/bootstrap");
+  state.me = data.user;
+  state.spaces = data.spaces;
+  state.invitations = data.invitations;
+  const saved = preferredSpaceId ?? localStorage.getItem("activeSpaceId");
+  const target = data.spaces.find((space) => space.id === saved)?.id ?? data.spaces[0]?.id ?? null;
+  state.activeSpaceId = target;
+  if (target) {
+    localStorage.setItem("activeSpaceId", target);
+    await loadSpace(target);
+  } else {
+    state.activeSpace = null;
+    state.members = [];
+    state.events = [];
+  }
+  startPolling();
 }
-async function loadSpace(spaceId) {
-    const data = await api(`/api/spaces/${spaceId}`);
-    state.activeSpace = data.space;
-    state.members = data.members;
-    state.ai = data.ai;
-    if (state.visibleMemberIds.size === 0 || [...state.visibleMemberIds].every((id) => !data.members.some((member) => member.id === id))) {
-        state.visibleMemberIds = new Set(data.members.map((member) => member.id));
-    }
-    else {
-        state.visibleMemberIds = new Set([...state.visibleMemberIds].filter((id) => data.members.some((member) => member.id === id)));
-    }
+
+async function loadSpace(spaceId: string): Promise<void> {
+  const data = await api<{ space: Space; members: Member[]; ai: AISettings }>(`/api/spaces/${spaceId}`);
+  state.activeSpace = data.space;
+  state.members = data.members;
+  state.ai = data.ai;
+  if (state.visibleMemberIds.size === 0 || [...state.visibleMemberIds].every((id) => !data.members.some((member) => member.id === id))) {
+    state.visibleMemberIds = new Set(data.members.map((member) => member.id));
+  } else {
+    state.visibleMemberIds = new Set([...state.visibleMemberIds].filter((id) => data.members.some((member) => member.id === id)));
+  }
+  await loadEvents();
+}
+
+async function loadEvents(): Promise<void> {
+  if (!state.activeSpaceId) return;
+  const range = currentLoadRange();
+  const data = await api<{ events: CalendarEvent[]; revision: number }>(
+    `/api/spaces/${state.activeSpaceId}/events?start=${range.start}&end=${range.end}`,
+  );
+  state.events = data.events;
+  state.revision = data.revision;
+}
+
+async function refreshQuietly(): Promise<void> {
+  try {
+    const beforeRevision = state.revision;
     await loadEvents();
-}
-async function loadEvents() {
-    if (!state.activeSpaceId)
-        return;
-    const range = currentLoadRange();
-    const data = await api(`/api/spaces/${state.activeSpaceId}/events?start=${range.start}&end=${range.end}`);
-    state.events = data.events;
-    state.revision = data.revision;
-}
-async function refreshQuietly() {
-    try {
-        const beforeRevision = state.revision;
-        await loadEvents();
-        if (beforeRevision !== state.revision) {
-            const bootstrapData = await api("/api/bootstrap");
-            state.spaces = bootstrapData.spaces;
-            state.invitations = bootstrapData.invitations;
-            state.activeSpace = state.spaces.find((space) => space.id === state.activeSpaceId) ?? state.activeSpace;
-            render();
-        }
+    if (beforeRevision !== state.revision) {
+      const bootstrapData = await api<{ user: User; spaces: Space[]; invitations: Invitation[] }>("/api/bootstrap");
+      state.spaces = bootstrapData.spaces;
+      state.invitations = bootstrapData.invitations;
+      state.activeSpace = state.spaces.find((space) => space.id === state.activeSpaceId) ?? state.activeSpace;
+      render();
     }
-    catch {
-        // 静默刷新失败不打断当前操作。
-    }
+  } catch {
+    // 静默刷新失败不打断当前操作。
+  }
 }
-function startPolling() {
-    if (pollTimer !== null)
-        window.clearInterval(pollTimer);
-    pollTimer = window.setInterval(() => {
-        if (!document.hidden && state.me && state.activeSpaceId && !state.modal)
-            void refreshQuietly();
-    }, 15_000);
+
+function startPolling(): void {
+  if (pollTimer !== null) window.clearInterval(pollTimer);
+  pollTimer = window.setInterval(() => {
+    if (!document.hidden && state.me && state.activeSpaceId && !state.modal) void refreshQuietly();
+  }, 15_000);
 }
-function render() {
-    if (state.loading) {
-        renderLoading();
-        return;
-    }
-    if (state.needsSetup) {
-        renderSetup();
-        return;
-    }
-    if (!state.me) {
-        renderAuth();
-        return;
-    }
-    renderApp();
+
+function render(): void {
+  if (state.loading) {
+    renderLoading();
+    return;
+  }
+  if (state.needsSetup) {
+    renderSetup();
+    return;
+  }
+  if (!state.me) {
+    renderAuth();
+    return;
+  }
+  renderApp();
 }
-function renderLoading() {
-    app.innerHTML = `
+
+function renderLoading(): void {
+  app.innerHTML = `
     <main class="center-page">
       <section class="auth-card loading-card">
         <div class="brand-mark">日</div>
@@ -157,8 +304,9 @@ function renderLoading() {
       </section>
     </main>`;
 }
-function renderSetup() {
-    app.innerHTML = `
+
+function renderSetup(): void {
+  app.innerHTML = `
     <main class="center-page">
       <section class="auth-card setup-card">
         <div class="brand-row">
@@ -175,40 +323,40 @@ function renderSetup() {
         <div class="soft-note">系统会同时创建你的第一个共享空间。之后其他人自行注册，再由空间管理员邀请加入。</div>
       </section>
     </main>`;
-    document.querySelector("#setup-form")?.addEventListener("submit", (event) => void submitSetup(event));
+  document.querySelector<HTMLFormElement>("#setup-form")?.addEventListener("submit", (event) => void submitSetup(event));
 }
-async function submitSetup(event) {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const formData = new FormData(form);
-    setFormBusy(form, true);
-    try {
-        await api("/api/setup", {
-            method: "POST",
-            body: {
-                username: formData.get("username"),
-                displayName: formData.get("displayName"),
-                password: formData.get("password"),
-            },
-            authOptional: true,
-        });
-        state.needsSetup = false;
-        state.error = null;
-        state.authMode = "login";
-        toast("管理员创建成功，请登录");
-        render();
-    }
-    catch (error) {
-        state.error = errorMessage(error);
-        renderSetup();
-    }
-    finally {
-        setFormBusy(form, false);
-    }
+
+async function submitSetup(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  const form = event.currentTarget as HTMLFormElement;
+  const formData = new FormData(form);
+  setFormBusy(form, true);
+  try {
+    await api("/api/setup", {
+      method: "POST",
+      body: {
+        username: formData.get("username"),
+        displayName: formData.get("displayName"),
+        password: formData.get("password"),
+      },
+      authOptional: true,
+    });
+    state.needsSetup = false;
+    state.error = null;
+    state.authMode = "login";
+    toast("管理员创建成功，请登录");
+    render();
+  } catch (error) {
+    state.error = errorMessage(error);
+    renderSetup();
+  } finally {
+    setFormBusy(form, false);
+  }
 }
-function renderAuth() {
-    const register = state.authMode === "register";
-    app.innerHTML = `
+
+function renderAuth(): void {
+  const register = state.authMode === "register";
+  app.innerHTML = `
     <main class="center-page auth-page">
       <section class="auth-card">
         <div class="brand-row">
@@ -229,91 +377,133 @@ function renderAuth() {
         <div class="soft-note">注册账号后不会自动看到别人的日历，需要接受邀请或使用空间邀请码申请加入。</div>
       </section>
     </main>`;
-    document.querySelectorAll("[data-auth-mode]").forEach((button) => {
-        button.addEventListener("click", () => {
-            state.authMode = button.dataset.authMode === "register" ? "register" : "login";
-            state.error = null;
-            renderAuth();
-        });
+  document.querySelectorAll<HTMLElement>("[data-auth-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.authMode = button.dataset.authMode === "register" ? "register" : "login";
+      state.error = null;
+      renderAuth();
     });
-    document.querySelector("#auth-form")?.addEventListener("submit", (event) => void submitAuth(event));
+  });
+  document.querySelector<HTMLFormElement>("#auth-form")?.addEventListener("submit", (event) => void submitAuth(event));
 }
-async function submitAuth(event) {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const formData = new FormData(form);
-    setFormBusy(form, true);
-    try {
-        if (state.authMode === "register") {
-            await api("/api/register", {
-                method: "POST",
-                body: {
-                    username: formData.get("username"),
-                    displayName: formData.get("displayName"),
-                    password: formData.get("password"),
-                },
-                authOptional: true,
-            });
-            state.authMode = "login";
-            state.error = null;
-            toast("注册成功，请登录");
-            renderAuth();
-            return;
-        }
-        const result = await api("/api/login", {
-            method: "POST",
-            body: { username: formData.get("username"), password: formData.get("password") },
-            authOptional: true,
-        });
-        state.me = result.user;
-        state.error = null;
-        await loadBootstrap();
-        render();
+
+async function submitAuth(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  const form = event.currentTarget as HTMLFormElement;
+  const formData = new FormData(form);
+  setFormBusy(form, true);
+  try {
+    if (state.authMode === "register") {
+      await api("/api/register", {
+        method: "POST",
+        body: {
+          username: formData.get("username"),
+          displayName: formData.get("displayName"),
+          password: formData.get("password"),
+        },
+        authOptional: true,
+      });
+      state.authMode = "login";
+      state.error = null;
+      toast("注册成功，请登录");
+      renderAuth();
+      return;
     }
-    catch (error) {
-        state.error = errorMessage(error);
-        renderAuth();
-    }
-    finally {
-        setFormBusy(form, false);
-    }
+    const result = await api<{ user: User }>("/api/login", {
+      method: "POST",
+      body: { username: formData.get("username"), password: formData.get("password") },
+      authOptional: true,
+    });
+    state.me = result.user;
+    state.error = null;
+    await loadBootstrap();
+    render();
+  } catch (error) {
+    state.error = errorMessage(error);
+    renderAuth();
+  } finally {
+    setFormBusy(form, false);
+  }
 }
-function renderApp() {
-    const space = state.activeSpace;
-    app.innerHTML = `
+
+function renderApp(): void {
+  const space = state.activeSpace;
+  app.innerHTML = `
     <div class="app-shell">
       ${renderTopbar()}
       ${state.spaces.length === 0 ? renderNoSpace() : space ? renderWorkspace() : renderNoSpace()}
     </div>
     ${renderModal()}`;
-    attachAppHandlers();
+  attachAppHandlers();
 }
-function renderTopbar() {
-    const activeId = state.activeSpaceId ?? "";
-    return `
+
+function renderTopbar(): string {
+  const activeId = state.activeSpaceId ?? "";
+  const activeSpaceName = state.activeSpace?.name ?? "尚未选择空间";
+  return `
     <header class="topbar panel-glass">
-      <div class="brand-compact"><div class="brand-mark small">日</div><div><strong>共享日历</strong><small>Space Calendar</small></div></div>
-      <div class="space-switcher">
-        <select id="space-select" class="field compact" aria-label="选择空间">
-          ${state.spaces.map((space) => `<option value="${space.id}" ${space.id === activeId ? "selected" : ""}>${escapeHtml(space.icon)} ${escapeHtml(space.name)}</option>`).join("")}
-        </select>
-        <button class="icon-btn" id="create-space-btn" title="创建空间">＋</button>
-        <button class="icon-btn" id="join-space-btn" title="申请加入空间">⌁</button>
+      <div class="topbar-main">
+        <div class="brand-compact">
+          <div class="brand-mark small">日</div>
+          <div><strong>共享日历</strong><small>多人空间日历</small></div>
+        </div>
+        <label class="space-context" for="space-select">
+          <span class="space-context-label">当前空间</span>
+          <select id="space-select" class="field compact" aria-label="切换当前空间" ${state.spaces.length ? "" : "disabled"}>
+            ${state.spaces.length
+              ? state.spaces.map((space) => `<option value="${space.id}" ${space.id === activeId ? "selected" : ""}>${escapeHtml(space.icon)} ${escapeHtml(space.name)}</option>`).join("")
+              : `<option value="">还没有空间</option>`}
+          </select>
+        </label>
+        <div class="top-actions">
+          <button class="secondary-btn smart-entry-btn" id="smart-add-btn" ${state.activeSpaceId ? "" : "disabled"} title="用自然语言添加日程">
+            ${uiIcon("sparkles")}<span>智能添加</span>
+          </button>
+          <button class="user-button" id="user-menu-btn" title="退出当前账号">
+            <span class="user-avatar">${escapeHtml(initials(state.me?.displayName ?? "我"))}</span>
+            <span class="user-copy"><strong>${escapeHtml(state.me?.displayName ?? "")}</strong><small>点击退出登录</small></span>
+            ${uiIcon("logout")}
+          </button>
+        </div>
       </div>
-      <nav class="view-tabs">
-        <button class="${state.viewMode === "month" ? "active" : ""}" data-view="month">月历</button>
-        <button class="${state.viewMode === "day" ? "active" : ""}" data-view="day">日视图</button>
-      </nav>
-      <div class="top-actions">
-        <button class="secondary-btn" id="smart-add-btn" ${state.activeSpaceId ? "" : "disabled"}>✦ 智能添加</button>
-        <button class="icon-btn notification-btn" id="notifications-btn" title="空间邀请">◎${state.invitations.length ? `<b>${state.invitations.length}</b>` : ""}</button>
-        ${state.me?.isPlatformAdmin ? `<button class="icon-btn" id="platform-admin-btn" title="平台管理">盾</button>` : ""}
-        <button class="user-button" id="user-menu-btn"><span>${escapeHtml(initials(state.me?.displayName ?? "我"))}</span><i>${escapeHtml(state.me?.displayName ?? "")}</i></button>
+      <div class="topbar-tools">
+        <nav class="space-commandbar" aria-label="空间功能">
+          <button class="command-btn" id="create-space-btn" title="创建一个新的共享日历空间">
+            <span class="command-icon">${uiIcon("folderPlus")}</span>
+            <span class="command-copy"><strong>创建共享空间</strong><small>新建独立日历</small></span>
+          </button>
+          <button class="command-btn" id="join-space-btn" title="使用空间邀请码申请加入">
+            <span class="command-icon">${uiIcon("logIn")}</span>
+            <span class="command-copy"><strong>加入空间</strong><small>输入邀请码申请</small></span>
+          </button>
+          <button class="command-btn notification-btn" id="notifications-btn" title="查看别人发给你的空间邀请">
+            <span class="command-icon">${uiIcon("mail")}</span>
+            <span class="command-copy"><strong>空间邀请</strong><small>${state.invitations.length ? `${state.invitations.length} 条待处理` : "暂无待处理邀请"}</small></span>
+            ${state.invitations.length ? `<b>${state.invitations.length}</b>` : ""}
+          </button>
+          ${state.activeSpaceId ? `<button class="command-btn" id="space-manage-btn" title="管理当前空间的成员、颜色、邀请和 AI">
+            <span class="command-icon">${uiIcon("settings")}</span>
+            <span class="command-copy"><strong>空间管理</strong><small>成员、颜色与 AI</small></span>
+          </button>` : ""}
+          ${state.me?.isPlatformAdmin ? `<button class="command-btn admin-command" id="platform-admin-btn" title="管理平台上的全部账号">
+            <span class="command-icon">${uiIcon("users")}</span>
+            <span class="command-copy"><strong>账号管理</strong><small>停用或重置账号</small></span>
+          </button>` : ""}
+        </nav>
+        <div class="view-switcher-wrap">
+          <span>视图</span>
+          <nav class="view-tabs" aria-label="日历视图">
+            <button class="${state.viewMode === "month" ? "active" : ""}" data-view="month">月历</button>
+            <button class="${state.viewMode === "day" ? "active" : ""}" data-view="day">日时间轴</button>
+          </nav>
+        </div>
       </div>
+      <div class="space-status-line"><span>${uiIcon("folder")}</span><strong>${escapeHtml(activeSpaceName)}</strong><small>${state.activeSpace ? `${state.activeSpace.memberCount} 位成员 · ${roleLabel(state.activeSpace.role)}` : "创建或加入空间后即可开始共享日程"}</small></div>
     </header>`;
 }
-function renderNoSpace() {
-    return `
+
+function renderNoSpace(): string {
+  return `
     <main class="empty-workspace panel-glass">
       <div class="empty-illustration">◫</div>
       <h2>还没有加入任何空间</h2>
@@ -324,39 +514,44 @@ function renderNoSpace() {
       </div>
     </main>`;
 }
-function renderWorkspace() {
-    return `
+
+function renderWorkspace(): string {
+  return `
     <main class="workspace">
       ${renderCalendarToolbar()}
       ${state.viewMode === "month" ? renderMonthView() : renderDayView()}
     </main>`;
 }
-function renderCalendarToolbar() {
-    const monthLabel = `${state.viewYear}年${state.viewMonth}月`;
-    const dayLabel = formatFullDate(state.selectedDate);
-    return `
+
+function renderCalendarToolbar(): string {
+  const monthLabel = `${state.viewYear}年${state.viewMonth}月`;
+  const dayLabel = formatFullDate(state.selectedDate);
+  return `
     <section class="calendar-toolbar panel-glass">
       <div class="date-nav">
-        <button class="icon-btn" id="prev-period">‹</button>
-        <button class="date-title" id="date-title-btn">${state.viewMode === "month" ? monthLabel : dayLabel}<small>${escapeHtml(state.activeSpace?.name ?? "")}</small></button>
-        <button class="icon-btn" id="next-period">›</button>
-        <button class="ghost-btn" id="today-btn">今天</button>
+        <button class="icon-btn" id="prev-period" aria-label="上一${state.viewMode === "month" ? "个月" : "天"}" title="上一${state.viewMode === "month" ? "个月" : "天"}">${uiIcon("chevronLeft")}</button>
+        <div class="date-title">${state.viewMode === "month" ? monthLabel : dayLabel}<small>${state.viewMode === "month" ? "点击日期查看当天详情" : "按成员查看当天时间安排"}</small></div>
+        <button class="icon-btn" id="next-period" aria-label="下一${state.viewMode === "month" ? "个月" : "天"}" title="下一${state.viewMode === "month" ? "个月" : "天"}">${uiIcon("chevronRight")}</button>
+        <button class="ghost-btn" id="today-btn">回到今天</button>
       </div>
-      <div class="member-filters">
-        ${state.members.map((member) => {
-        const active = state.visibleMemberIds.has(member.id);
-        return `<button class="member-filter ${active ? "active" : ""}" data-member-filter="${member.id}" style="--member:${member.color}"><i></i>${escapeHtml(member.displayName)}</button>`;
-    }).join("")}
+      <div class="member-filter-wrap">
+        <span class="toolbar-label">显示成员</span>
+        <div class="member-filters">
+          ${state.members.map((member) => {
+            const active = state.visibleMemberIds.has(member.id);
+            return `<button class="member-filter ${active ? "active" : ""}" data-member-filter="${member.id}" style="--member:${member.color}" title="${active ? "点击隐藏" : "点击显示"}${escapeAttr(member.displayName)}的日程"><i></i>${escapeHtml(member.displayName)}</button>`;
+          }).join("")}
+        </div>
       </div>
       <div class="toolbar-actions">
-        <button class="secondary-btn" id="new-event-btn">＋ 新建日程</button>
-        <button class="icon-btn" id="space-manage-btn" title="空间设置">⚙</button>
+        <button class="primary-btn new-event-clear-btn" id="new-event-btn">${uiIcon("calendarPlus")}<span>新建日程</span></button>
       </div>
     </section>`;
 }
-function renderMonthView() {
-    const days = monthGridDays(state.viewYear, state.viewMonth);
-    return `
+
+function renderMonthView(): string {
+  const days = monthGridDays(state.viewYear, state.viewMonth);
+  return `
     <section class="month-panel panel-glass">
       <div class="weekday-row">${["一", "二", "三", "四", "五", "六", "日"].map((day) => `<div>${day}</div>`).join("")}</div>
       <div class="month-grid">
@@ -364,21 +559,22 @@ function renderMonthView() {
       </div>
     </section>`;
 }
-function renderDayCell(date) {
-    const dateString = localDateString(date);
-    const inMonth = date.getMonth() + 1 === state.viewMonth;
-    const isToday = dateString === localDateString(new Date());
-    const isSelected = dateString === state.selectedDate;
-    const dayEvents = filteredEventsForDate(dateString);
-    const memberSummaries = summarizeByMember(dayEvents);
-    const displayed = memberSummaries.length > 3
-        ? memberSummaries.slice(0, 2)
-        : memberSummaries.slice(0, 3);
-    const remaining = Math.max(0, memberSummaries.length - displayed.length);
-    const subtleGradient = memberSummaries.length
-        ? `linear-gradient(135deg, ${hexToRgba(memberSummaries[0].member.color, 0.06)}, rgba(232,235,241,.72) 54%)`
-        : "none";
-    return `
+
+function renderDayCell(date: Date): string {
+  const dateString = localDateString(date);
+  const inMonth = date.getMonth() + 1 === state.viewMonth;
+  const isToday = dateString === localDateString(new Date());
+  const isSelected = dateString === state.selectedDate;
+  const dayEvents = filteredEventsForDate(dateString);
+  const memberSummaries = summarizeByMember(dayEvents);
+  const displayed = memberSummaries.length > 3
+    ? memberSummaries.slice(0, 2)
+    : memberSummaries.slice(0, 3);
+  const remaining = Math.max(0, memberSummaries.length - displayed.length);
+  const subtleGradient = memberSummaries.length
+    ? `linear-gradient(135deg, ${hexToRgba(memberSummaries[0].member.color, 0.06)}, rgba(232,235,241,.72) 54%)`
+    : "none";
+  return `
     <button class="day-cell ${inMonth ? "" : "outside"} ${isToday ? "today" : ""} ${isSelected ? "selected" : ""}" data-day="${dateString}" style="--day-tint:${subtleGradient}">
       <div class="day-head"><span class="day-number">${date.getDate()}</span>${dayEvents.length ? `<small>${dayEvents.length}项</small>` : ""}</div>
       <div class="day-strips">
@@ -390,13 +586,14 @@ function renderDayCell(date) {
       </div>
     </button>`;
 }
-function renderDayView() {
-    const visibleMembers = state.members.filter((member) => state.visibleMemberIds.has(member.id));
-    const dayEvents = filteredEventsForDate(state.selectedDate);
-    const allDayEvents = dayEvents.filter((event) => event.allDay);
-    const timedEvents = dayEvents.filter((event) => !event.allDay && event.startTime);
-    const hours = Array.from({ length: 19 }, (_, index) => index + 6);
-    return `
+
+function renderDayView(): string {
+  const visibleMembers = state.members.filter((member) => state.visibleMemberIds.has(member.id));
+  const dayEvents = filteredEventsForDate(state.selectedDate);
+  const allDayEvents = dayEvents.filter((event) => event.allDay);
+  const timedEvents = dayEvents.filter((event) => !event.allDay && event.startTime);
+  const hours = Array.from({ length: 19 }, (_, index) => index + 6);
+  return `
     <section class="day-panel panel-glass">
       <div class="day-summary-head">
         <div><h2>${formatFullDate(state.selectedDate)}</h2><p>${visibleMembers.length} 位成员 · ${dayEvents.length} 项安排</p></div>
@@ -419,8 +616,9 @@ function renderDayView() {
       ${visibleMembers.length === 0 ? `<div class="empty-state">至少选择一位成员才能查看时间轴。</div>` : ""}
     </section>`;
 }
-function renderMemberTimeline(member, events) {
-    return `
+
+function renderMemberTimeline(member: Member, events: CalendarEvent[]): string {
+  return `
     <div class="timeline-row">
       <div class="timeline-member-label"><i style="background:${member.color}"></i><strong>${escapeHtml(member.displayName)}</strong><small>${roleLabel(member.role)}</small></div>
       <div class="timeline-track">
@@ -429,52 +627,48 @@ function renderMemberTimeline(member, events) {
       </div>
     </div>`;
 }
-function renderTimelineEvent(event, member, stackIndex) {
-    const start = Math.max(6 * 60, timeToMinutes(event.startTime ?? "06:00"));
-    const end = Math.min(24 * 60, timeToMinutes(event.endTime ?? addMinutes(event.startTime ?? "06:00", 60)));
-    const left = ((start - 6 * 60) / (18 * 60)) * 100;
-    const width = Math.max(2.4, ((Math.max(end, start + 30) - start) / (18 * 60)) * 100);
-    const top = 10 + (stackIndex % 2) * 31;
-    return `<button class="timeline-event" data-event-id="${event.id}" style="left:${left}%;width:${width}%;top:${top}px;--member:${member.color};--member-bg:${hexToRgba(member.color, 0.24)}" title="${escapeHtml(event.title)}"><strong>${escapeHtml(event.title)}</strong><small>${event.startTime}–${event.endTime ?? ""}</small></button>`;
+
+function renderTimelineEvent(event: CalendarEvent, member: Member, stackIndex: number): string {
+  const start = Math.max(6 * 60, timeToMinutes(event.startTime ?? "06:00"));
+  const end = Math.min(24 * 60, timeToMinutes(event.endTime ?? addMinutes(event.startTime ?? "06:00", 60)));
+  const left = ((start - 6 * 60) / (18 * 60)) * 100;
+  const width = Math.max(2.4, ((Math.max(end, start + 30) - start) / (18 * 60)) * 100);
+  const top = 10 + (stackIndex % 2) * 31;
+  return `<button class="timeline-event" data-event-id="${event.id}" style="left:${left}%;width:${width}%;top:${top}px;--member:${member.color};--member-bg:${hexToRgba(member.color, 0.24)}" title="${escapeHtml(event.title)}"><strong>${escapeHtml(event.title)}</strong><small>${event.startTime}–${event.endTime ?? ""}</small></button>`;
 }
-function renderCompactEvent(event) {
-    const colors = event.assignedUserIds.map((id) => state.members.find((member) => member.id === id)?.color).filter(Boolean);
-    const color = colors[0] ?? "#697386";
-    return `<button class="compact-event" data-event-id="${event.id}" style="--member:${color};--member-bg:${hexToRgba(color, .16)}"><strong>${escapeHtml(event.title)}</strong><span>${escapeHtml(memberNames(event.assignedUserIds))}</span></button>`;
+
+function renderCompactEvent(event: CalendarEvent): string {
+  const colors = event.assignedUserIds.map((id) => state.members.find((member) => member.id === id)?.color).filter(Boolean) as string[];
+  const color = colors[0] ?? "#697386";
+  return `<button class="compact-event" data-event-id="${event.id}" style="--member:${color};--member-bg:${hexToRgba(color, .16)}"><strong>${escapeHtml(event.title)}</strong><span>${escapeHtml(memberNames(event.assignedUserIds))}</span></button>`;
 }
-function renderModal() {
-    if (!state.modal)
-        return "";
-    if (state.modal === "event")
-        return renderEventModal();
-    if (state.modal === "smart")
-        return renderSmartModal();
-    if (state.modal === "dayDetail")
-        return renderDayDetailModal();
-    if (state.modal === "createSpace")
-        return renderCreateSpaceModal();
-    if (state.modal === "joinSpace")
-        return renderJoinSpaceModal();
-    if (state.modal === "notifications")
-        return renderNotificationsModal();
-    if (state.modal === "spaceManage")
-        return renderSpaceManageModal();
-    if (state.modal === "platformAdmin")
-        return renderPlatformAdminModal();
-    return "";
+
+function renderModal(): string {
+  if (!state.modal) return "";
+  if (state.modal === "event") return renderEventModal();
+  if (state.modal === "smart") return renderSmartModal();
+  if (state.modal === "dayDetail") return renderDayDetailModal();
+  if (state.modal === "createSpace") return renderCreateSpaceModal();
+  if (state.modal === "joinSpace") return renderJoinSpaceModal();
+  if (state.modal === "notifications") return renderNotificationsModal();
+  if (state.modal === "spaceManage") return renderSpaceManageModal();
+  if (state.modal === "platformAdmin") return renderPlatformAdminModal();
+  return "";
 }
-function modalShell(title, body, className = "") {
-    return `<div class="modal-backdrop" data-close-modal><section class="modal ${className}" role="dialog" aria-modal="true" onclick="event.stopPropagation()"><header class="modal-header"><h2>${escapeHtml(title)}</h2><button class="icon-btn" id="close-modal">×</button></header>${body}</section></div>`;
+
+function modalShell(title: string, body: string, className = ""): string {
+  return `<div class="modal-backdrop" data-close-modal><section class="modal ${className}" role="dialog" aria-modal="true" onclick="event.stopPropagation()"><header class="modal-header"><h2>${escapeHtml(title)}</h2><button class="icon-btn" id="close-modal">×</button></header>${body}</section></div>`;
 }
-function renderEventModal() {
-    const event = state.editingEvent;
-    const admin = isSpaceAdmin();
-    const date = event?.startDate ?? state.selectedDate;
-    const assigned = new Set(event?.assignedUserIds ?? [state.me?.id ?? ""]);
-    const canDelete = event ? canManageEvent(event) : false;
-    const editable = !event || canManageEvent(event);
-    const disabled = editable ? "" : "disabled";
-    return modalShell(event ? "编辑日程" : "新建日程", `
+
+function renderEventModal(): string {
+  const event = state.editingEvent;
+  const admin = isSpaceAdmin();
+  const date = event?.startDate ?? state.selectedDate;
+  const assigned = new Set(event?.assignedUserIds ?? [state.me?.id ?? ""]);
+  const canDelete = event ? canManageEvent(event) : false;
+  const editable = !event || canManageEvent(event);
+  const disabled = editable ? "" : "disabled";
+  return modalShell(event ? "编辑日程" : "新建日程", `
     <form id="event-form" class="modal-body">
       <div class="form-grid">
         <label class="form-group full">事项名称<input class="field" name="title" required maxlength="100" value="${escapeAttr(event?.title ?? "")}" placeholder="例如：和同学去看电影" ${disabled} /></label>
@@ -495,12 +689,13 @@ function renderEventModal() {
       </footer>
     </form>`);
 }
-function renderSmartModal() {
-    const draft = state.draft;
-    const examples = isSpaceAdmin()
-        ? "例如：8月18号下午2点到4点，给小王和小李安排项目讨论，地点会议室A"
-        : "例如：18号晚上7点和小李看电影；下周三下午3点去健身";
-    return modalShell("智能添加日程", `
+
+function renderSmartModal(): string {
+  const draft = state.draft;
+  const examples = isSpaceAdmin()
+    ? "例如：8月18号下午2点到4点，给小王和小李安排项目讨论，地点会议室A"
+    : "例如：18号晚上7点和小李看电影；下周三下午3点去健身";
+  return modalShell("智能添加日程", `
     <div class="modal-body smart-body">
       <div class="smart-intro"><span>✦</span><div><strong>${state.ai?.enabled ? "规则识别 + 空间 AI" : "轻量规则识别"}</strong><p>${isSpaceAdmin() ? "你是空间管理员，可以为多个成员分配日程。" : "你是普通成员，系统只会给你本人创建日程。"}</p></div></div>
       <form id="smart-form" class="smart-input-row">
@@ -511,8 +706,9 @@ function renderSmartModal() {
       ${draft ? renderDraftPreview(draft) : `<div class="smart-empty"><i>⌁</i><p>输入一句自然语言，系统先生成预览，确认后才会写入日历。</p></div>`}
     </div>`);
 }
-function renderDraftPreview(draft) {
-    return `<section class="draft-card">
+
+function renderDraftPreview(draft: EventDraft): string {
+  return `<section class="draft-card">
     <div class="draft-source"><span>${draft.source === "ai" ? "AI" : "规则"}</span>${escapeHtml(draft.explanation)}</div>
     <div class="draft-title">${escapeHtml(draft.title)}</div>
     <dl>
@@ -525,84 +721,93 @@ function renderDraftPreview(draft) {
     <div class="inline-actions end"><button class="ghost-btn" id="clear-draft">重新输入</button><button class="primary-btn" id="confirm-draft">确认加入日历</button></div>
   </section>`;
 }
-function renderDayDetailModal() {
-    const dayEvents = filteredEventsForDate(state.selectedDate);
-    return modalShell(formatFullDate(state.selectedDate), `
+
+function renderDayDetailModal(): string {
+  const dayEvents = filteredEventsForDate(state.selectedDate);
+  return modalShell(formatFullDate(state.selectedDate), `
     <div class="modal-body day-detail-body">
       <div class="day-detail-toolbar"><span>${dayEvents.length} 项安排</span><div class="inline-actions"><button class="secondary-btn" id="open-full-day">打开日视图</button><button class="primary-btn" id="detail-add-event">＋ 添加</button></div></div>
       ${state.members.filter((member) => state.visibleMemberIds.has(member.id)).map((member) => {
         const events = dayEvents.filter((event) => event.assignedUserIds.includes(member.id));
         return `<section class="member-day-section"><header><i style="background:${member.color}"></i><strong>${escapeHtml(member.displayName)}</strong><span>${events.length}项</span></header>${events.length ? events.map((event) => renderDayEventCard(event, member)).join("") : `<div class="member-free">当天暂无安排</div>`}</section>`;
-    }).join("")}
+      }).join("")}
     </div>`, "wide-modal");
 }
-function renderDayEventCard(event, member) {
-    return `<button class="day-event-card" data-event-id="${event.id}" style="--member:${member.color};--member-bg:${hexToRgba(member.color, .13)}"><span class="event-time">${event.allDay ? "全天" : `${event.startTime ?? ""}${event.endTime ? `–${event.endTime}` : ""}`}</span><span><strong>${escapeHtml(event.title)}</strong><small>${[event.location, event.companions].filter(Boolean).map(escapeHtml).join(" · ") || "点击查看详情"}</small></span></button>`;
+
+function renderDayEventCard(event: CalendarEvent, member: Member): string {
+  return `<button class="day-event-card" data-event-id="${event.id}" style="--member:${member.color};--member-bg:${hexToRgba(member.color, .13)}"><span class="event-time">${event.allDay ? "全天" : `${event.startTime ?? ""}${event.endTime ? `–${event.endTime}` : ""}`}</span><span><strong>${escapeHtml(event.title)}</strong><small>${[event.location, event.companions].filter(Boolean).map(escapeHtml).join(" · ") || "点击查看详情"}</small></span></button>`;
 }
-function renderCreateSpaceModal() {
-    return modalShell("创建共享空间", `
+
+function renderCreateSpaceModal(): string {
+  return modalShell("创建共享空间", `
     <form id="create-space-form" class="modal-body stack-form">
+      <div class="modal-guide">${uiIcon("folderPlus")}<div><strong>新建一个独立的共享日历</strong><p>不同空间的成员、颜色、日程和 AI 设置互不影响。</p></div></div>
       <label>空间名称<input class="field" name="name" required maxlength="40" placeholder="例如：我们三个同学" /></label>
-      <label>图标<input class="field" name="icon" maxlength="4" value="✦" placeholder="一个 Emoji 或符号" /></label>
-      <label>空间简介<textarea class="field" name="description" maxlength="160" placeholder="这个空间用来做什么"></textarea></label>
-      <div class="soft-note">创建后你会成为空间所有者，可以邀请成员、设置管理员和配置 AI。</div>
-      <div class="modal-actions end"><button type="button" class="ghost-btn" id="cancel-modal">取消</button><button class="primary-btn" type="submit">创建空间</button></div>
+      <label>空间图标<input class="field" name="icon" maxlength="4" value="✦" placeholder="输入一个 Emoji，例如 👥" /></label>
+      <label>空间简介<textarea class="field" name="description" maxlength="160" placeholder="简单说明这个空间用于什么"></textarea></label>
+      <div class="soft-note">创建完成后，你会成为该空间的所有者，可以邀请成员、设置管理员、调整成员颜色和配置空间 AI。</div>
+      <div class="modal-actions end"><button type="button" class="ghost-btn" id="cancel-modal">取消</button><button class="primary-btn" type="submit">确认创建共享空间</button></div>
     </form>`);
 }
-function renderJoinSpaceModal() {
-    return modalShell("申请加入空间", `
+
+function renderJoinSpaceModal(): string {
+  return modalShell("通过邀请码加入空间", `
     <form id="join-space-form" class="modal-body stack-form">
+      <div class="modal-guide">${uiIcon("logIn")}<div><strong>申请加入别人创建的共享空间</strong><p>向空间管理员索要邀请码，提交后等待管理员同意。</p></div></div>
       <label>空间邀请码<input class="field code-input" name="inviteCode" required maxlength="24" placeholder="例如 ABCD2345" /></label>
-      <div class="soft-note">提交后需要空间管理员同意。加入后才能看到该空间成员和日程。</div>
-      <div class="modal-actions end"><button type="button" class="ghost-btn" id="cancel-modal">取消</button><button class="primary-btn" type="submit">提交申请</button></div>
+      <div class="soft-note">通过申请后，你才能看到该空间的成员与共享日程。不同空间之间的数据不会混在一起。</div>
+      <div class="modal-actions end"><button type="button" class="ghost-btn" id="cancel-modal">取消</button><button class="primary-btn" type="submit">提交加入申请</button></div>
     </form>`);
 }
-function renderNotificationsModal() {
-    return modalShell("空间邀请", `
+
+function renderNotificationsModal(): string {
+  return modalShell("收到的空间邀请", `
     <div class="modal-body">
       ${state.invitations.length ? `<div class="notification-list">${state.invitations.map((item) => `<article class="notification-card"><div class="space-icon">◫</div><div><strong>${escapeHtml(item.inviterName)} 邀请你加入</strong><h3>${escapeHtml(item.spaceName)}</h3><small>${formatDateTime(item.createdAt)}</small></div><div class="notification-actions"><button class="ghost-btn" data-invite-decline="${item.id}">拒绝</button><button class="primary-btn" data-invite-accept="${item.id}">接受</button></div></article>`).join("")}</div>` : `<div class="empty-state large">暂时没有待处理的空间邀请。</div>`}
     </div>`);
 }
-function renderSpaceManageModal() {
-    const tab = state.manageTab;
-    return modalShell("空间管理", `
+
+function renderSpaceManageModal(): string {
+  const tab = state.manageTab;
+  return modalShell(`管理空间：${state.activeSpace?.name ?? ""}`, `
     <div class="manage-layout">
-      <aside class="manage-tabs">
-        <button class="${tab === "members" ? "active" : ""}" data-manage-tab="members">成员与颜色</button>
-        <button class="${tab === "invite" ? "active" : ""}" data-manage-tab="invite">邀请与申请</button>
-        <button class="${tab === "settings" ? "active" : ""}" data-manage-tab="settings">空间设置</button>
-        <button class="${tab === "ai" ? "active" : ""}" data-manage-tab="ai">AI 设置</button>
+      <aside class="manage-tabs" aria-label="空间管理功能">
+        <button class="${tab === "members" ? "active" : ""}" data-manage-tab="members"><span>${uiIcon("palette")}</span><span><strong>成员与颜色</strong><small>角色、颜色与移除</small></span></button>
+        <button class="${tab === "invite" ? "active" : ""}" data-manage-tab="invite"><span>${uiIcon("userPlus")}</span><span><strong>邀请与申请</strong><small>邀请账号、审批加入</small></span></button>
+        <button class="${tab === "settings" ? "active" : ""}" data-manage-tab="settings"><span>${uiIcon("sliders")}</span><span><strong>空间资料设置</strong><small>名称、图标与权限</small></span></button>
+        <button class="${tab === "ai" ? "active" : ""}" data-manage-tab="ai"><span>${uiIcon("bot")}</span><span><strong>空间 AI 配置</strong><small>接口、模型与密钥</small></span></button>
       </aside>
       <div class="manage-content">${renderManageContent()}</div>
     </div>`, "wide-modal manage-modal");
 }
-function renderManageContent() {
-    if (state.manageTab === "members")
-        return renderMembersManage();
-    if (state.manageTab === "invite")
-        return renderInviteManage();
-    if (state.manageTab === "settings")
-        return renderSettingsManage();
-    return renderAIManage();
+
+function renderManageContent(): string {
+  if (state.manageTab === "members") return renderMembersManage();
+  if (state.manageTab === "invite") return renderInviteManage();
+  if (state.manageTab === "settings") return renderSettingsManage();
+  return renderAIManage();
 }
-function renderMembersManage() {
-    const owner = currentMember()?.role === "owner";
-    return `<div class="manage-section"><div class="section-heading"><div><h3>成员与颜色</h3><p>颜色仅在当前空间生效，系统会阻止过于相近的颜色。</p></div><span>${state.members.length} 人</span></div>
+
+function renderMembersManage(): string {
+  const owner = currentMember()?.role === "owner";
+  return `<div class="manage-section"><div class="section-heading"><div><h3>成员与颜色</h3><p>颜色仅在当前空间生效，系统会阻止过于相近的颜色。</p></div><span>${state.members.length} 人</span></div>
     <div class="member-manage-list">${state.members.map((member) => `<article class="member-manage-card"><div class="member-avatar" style="background:${member.color}">${escapeHtml(initials(member.displayName))}</div><div class="member-info"><strong>${escapeHtml(member.displayName)}${member.isMe ? "（我）" : ""}</strong><small>@${escapeHtml(member.username)} · ${roleLabel(member.role)}</small></div><label class="color-control"><input type="color" value="${member.color}" data-color-user="${member.id}" ${member.isMe || isSpaceAdmin() ? "" : "disabled"} /><span>${member.color}</span></label>${owner && member.role !== "owner" ? `<select class="field role-select" data-role-user="${member.id}"><option value="member" ${member.role === "member" ? "selected" : ""}>普通成员</option><option value="admin" ${member.role === "admin" ? "selected" : ""}>空间管理员</option></select>` : ""}${member.role !== "owner" && (member.isMe || isSpaceAdmin()) ? `<button class="danger-icon" data-remove-member="${member.id}" title="${member.isMe ? "退出空间" : "移除成员"}">×</button>` : ""}</article>`).join("")}</div>
   </div>`;
 }
-function renderInviteManage() {
-    const canInvite = isSpaceAdmin() || Boolean(state.activeSpace?.allowMemberInvites);
-    return `<div class="manage-section"><div class="section-heading"><div><h3>邀请与加入申请</h3><p>可以直接邀请已有账号，也可以把邀请码发给别人。</p></div></div>
+
+function renderInviteManage(): string {
+  const canInvite = isSpaceAdmin() || Boolean(state.activeSpace?.allowMemberInvites);
+  return `<div class="manage-section"><div class="section-heading"><div><h3>邀请与加入申请</h3><p>可以直接邀请已有账号，也可以把邀请码发给别人。</p></div></div>
     ${canInvite ? `<form id="invite-user-form" class="inline-form"><input class="field" name="username" required placeholder="输入对方用户名，例如 xiaowang" /><button class="primary-btn">发送邀请</button></form>` : `<div class="soft-note">当前空间仅管理员可以邀请成员。</div>`}
     ${isSpaceAdmin() ? `<div class="invite-code-card"><div><small>空间邀请码</small><strong>${escapeHtml(state.activeSpace?.inviteCode ?? "加载中")}</strong></div><button class="secondary-btn" id="copy-invite-code">复制</button><button class="ghost-btn" id="regenerate-code">重新生成</button></div>` : ""}
     ${isSpaceAdmin() ? `<h4 class="subheading">待处理申请</h4><div class="request-list">${state.joinRequests.filter((item) => item.status === "pending").length ? state.joinRequests.filter((item) => item.status === "pending").map((item) => `<article><div><strong>${escapeHtml(item.displayName)}</strong><small>@${escapeHtml(item.username)} · ${formatDateTime(item.createdAt)}</small></div><div class="inline-actions"><button class="ghost-btn" data-request-decline="${item.id}">拒绝</button><button class="primary-btn" data-request-approve="${item.id}">同意</button></div></article>`).join("") : `<div class="empty-state">暂无待处理申请</div>`}</div>` : ""}
     ${isSpaceAdmin() ? `<h4 class="subheading">邀请记录</h4><div class="history-list">${state.manageInvitations.slice(0, 20).map((item) => `<div><span>${escapeHtml(item.inviteeName)} <small>@${escapeHtml(item.inviteeUsername)}</small></span><b class="status-${item.status}">${statusLabel(item.status)}</b></div>`).join("") || `<div class="empty-state">暂无邀请记录</div>`}</div>` : ""}
   </div>`;
 }
-function renderSettingsManage() {
-    const canManage = isSpaceAdmin();
-    return `<form id="space-settings-form" class="manage-section stack-form"><div class="section-heading"><div><h3>空间设置</h3><p>空间名称、图标和成员邀请权限。</p></div></div>
+
+function renderSettingsManage(): string {
+  const canManage = isSpaceAdmin();
+  return `<form id="space-settings-form" class="manage-section stack-form"><div class="section-heading"><div><h3>空间设置</h3><p>空间名称、图标和成员邀请权限。</p></div></div>
     <label>空间名称<input class="field" name="name" maxlength="40" required value="${escapeAttr(state.activeSpace?.name ?? "")}" ${canManage ? "" : "disabled"} /></label>
     <label>图标<input class="field" name="icon" maxlength="4" value="${escapeAttr(state.activeSpace?.icon ?? "✦")}" ${canManage ? "" : "disabled"} /></label>
     <label>简介<textarea class="field" name="description" maxlength="160" ${canManage ? "" : "disabled"}>${escapeHtml(state.activeSpace?.description ?? "")}</textarea></label>
@@ -611,10 +816,10 @@ function renderSettingsManage() {
     ${currentMember()?.role === "owner" ? `<div class="danger-zone"><div><strong>解散空间</strong><p>会删除该空间的成员关系和全部日程，无法恢复。</p></div><button type="button" class="danger-btn" id="delete-space-btn">解散空间</button></div>` : ""}
   </form>`;
 }
-function renderAIManage() {
-    if (!state.ai?.canManage)
-        return `<div class="manage-section"><div class="section-heading"><div><h3>AI 设置</h3><p>AI 配置只对当前空间生效。</p></div></div><div class="permission-empty">只有空间所有者或管理员可以查看和修改 AI 配置。普通成员仍可使用管理员启用的智能添加功能。</div></div>`;
-    return `<form id="ai-settings-form" class="manage-section stack-form"><div class="section-heading"><div><h3>空间 AI</h3><p>规则识别始终免费可用；规则无法理解时才调用你配置的 OpenAI 兼容接口。</p></div><span class="ai-state ${state.ai.enabled ? "on" : ""}">${state.ai.enabled ? "已启用" : "未启用"}</span></div>
+
+function renderAIManage(): string {
+  if (!state.ai?.canManage) return `<div class="manage-section"><div class="section-heading"><div><h3>AI 设置</h3><p>AI 配置只对当前空间生效。</p></div></div><div class="permission-empty">只有空间所有者或管理员可以查看和修改 AI 配置。普通成员仍可使用管理员启用的智能添加功能。</div></div>`;
+  return `<form id="ai-settings-form" class="manage-section stack-form"><div class="section-heading"><div><h3>空间 AI</h3><p>规则识别始终免费可用；规则无法理解时才调用你配置的 OpenAI 兼容接口。</p></div><span class="ai-state ${state.ai.enabled ? "on" : ""}">${state.ai.enabled ? "已启用" : "未启用"}</span></div>
     <label class="switch-line"><input type="checkbox" name="enabled" ${state.ai.enabled ? "checked" : ""} /><span><strong>启用空间 AI</strong><small>普通成员也能使用，但仍受权限限制。</small></span></label>
     <label>API URL<input class="field" name="endpoint" value="${escapeAttr(state.ai.endpoint)}" placeholder="https://api.example.com/v1" /></label>
     <label>Model Name<input class="field" name="model" value="${escapeAttr(state.ai.model)}" placeholder="例如 deepseek-chat" /></label>
@@ -623,724 +828,754 @@ function renderAIManage() {
     <div class="inline-actions end"><button class="primary-btn" type="submit">保存 AI 设置</button></div>
   </form>`;
 }
-function renderPlatformAdminModal() {
-    return modalShell("平台账号管理", `
+
+function renderPlatformAdminModal(): string {
+  return modalShell("平台账号管理（仅平台管理员）", `
     <div class="modal-body platform-admin-body">
       <div class="section-heading"><div><h3>全部账号</h3><p>平台管理员可以停用账号或重置密码，但不能直接查看用户密码。</p></div><span>${state.platformUsers.length} 个账号</span></div>
       <div class="platform-user-list">${state.platformUsers.map((account) => `<article><div class="member-avatar neutral">${escapeHtml(initials(account.displayName))}</div><div class="member-info"><strong>${escapeHtml(account.displayName)}${account.isPlatformAdmin ? " · 平台管理员" : ""}</strong><small>@${escapeHtml(account.username)} · ${account.spaces} 个空间 · ${account.disabled ? "已停用" : "正常"}</small></div><button class="${account.disabled ? "secondary-btn" : "danger-btn"}" data-toggle-user="${account.id}" data-disabled="${account.disabled ? "1" : "0"}">${account.disabled ? "恢复" : "停用"}</button><button class="ghost-btn" data-reset-password="${account.id}">重置密码</button></article>`).join("")}</div>
     </div>`, "wide-modal");
 }
-function attachAppHandlers() {
-    document.querySelector("#space-select")?.addEventListener("change", (event) => void switchSpace(event.target.value));
-    document.querySelector("#create-space-btn")?.addEventListener("click", () => openModal("createSpace"));
-    document.querySelector("#join-space-btn")?.addEventListener("click", () => openModal("joinSpace"));
-    document.querySelector("#empty-create-space")?.addEventListener("click", () => openModal("createSpace"));
-    document.querySelector("#empty-join-space")?.addEventListener("click", () => openModal("joinSpace"));
-    document.querySelector("#smart-add-btn")?.addEventListener("click", () => { state.draft = null; openModal("smart"); });
-    document.querySelector("#notifications-btn")?.addEventListener("click", () => openModal("notifications"));
-    document.querySelector("#platform-admin-btn")?.addEventListener("click", () => void openPlatformAdmin());
-    document.querySelector("#user-menu-btn")?.addEventListener("click", () => void logout());
-    document.querySelector("#new-event-btn")?.addEventListener("click", () => openEventModal());
-    document.querySelector("#day-add-event")?.addEventListener("click", () => openEventModal());
-    document.querySelector("#space-manage-btn")?.addEventListener("click", () => void openSpaceManage());
-    document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => {
-        state.viewMode = button.dataset.view === "day" ? "day" : "month";
-        render();
-    }));
-    document.querySelector("#prev-period")?.addEventListener("click", () => changePeriod(-1));
-    document.querySelector("#next-period")?.addEventListener("click", () => changePeriod(1));
-    document.querySelector("#today-btn")?.addEventListener("click", () => void goToday());
-    document.querySelectorAll("[data-member-filter]").forEach((button) => button.addEventListener("click", () => toggleMemberFilter(button.dataset.memberFilter ?? "")));
-    document.querySelectorAll("[data-day]").forEach((cell) => cell.addEventListener("click", () => {
-        state.selectedDate = cell.dataset.day ?? state.selectedDate;
-        openModal("dayDetail");
-    }));
-    document.querySelectorAll("[data-event-id]").forEach((button) => button.addEventListener("click", () => {
-        const event = state.events.find((item) => item.id === button.dataset.eventId);
-        if (event)
-            openEventModal(event);
-    }));
-    attachModalHandlers();
-}
-function attachModalHandlers() {
-    document.querySelector("#close-modal")?.addEventListener("click", closeModal);
-    document.querySelector("#cancel-modal")?.addEventListener("click", closeModal);
-    document.querySelector("[data-close-modal]")?.addEventListener("click", closeModal);
-    document.querySelector("#event-form")?.addEventListener("submit", (event) => void submitEvent(event));
-    document.querySelector('input[name="allDay"]')?.addEventListener("change", updateTimeFieldState);
-    updateTimeFieldState();
-    document.querySelector("#delete-event-btn")?.addEventListener("click", () => void deleteCurrentEvent());
-    document.querySelector("#smart-form")?.addEventListener("submit", (event) => void submitSmartParse(event));
-    document.querySelector("#clear-draft")?.addEventListener("click", () => { state.draft = null; render(); });
-    document.querySelector("#confirm-draft")?.addEventListener("click", () => void confirmDraft());
-    document.querySelector("#open-full-day")?.addEventListener("click", () => { state.viewMode = "day"; closeModal(); });
-    document.querySelector("#detail-add-event")?.addEventListener("click", () => openEventModal());
-    document.querySelector("#create-space-form")?.addEventListener("submit", (event) => void submitCreateSpace(event));
-    document.querySelector("#join-space-form")?.addEventListener("submit", (event) => void submitJoinSpace(event));
-    document.querySelectorAll("[data-invite-accept]").forEach((button) => button.addEventListener("click", () => void respondInvitation(button.dataset.inviteAccept ?? "", "accept")));
-    document.querySelectorAll("[data-invite-decline]").forEach((button) => button.addEventListener("click", () => void respondInvitation(button.dataset.inviteDecline ?? "", "decline")));
-    document.querySelectorAll("[data-manage-tab]").forEach((button) => button.addEventListener("click", () => void changeManageTab(button.dataset.manageTab)));
-    document.querySelectorAll("[data-color-user]").forEach((input) => input.addEventListener("change", () => void updateMember(input.dataset.colorUser ?? "", { color: input.value })));
-    document.querySelectorAll("[data-role-user]").forEach((select) => select.addEventListener("change", () => void updateMember(select.dataset.roleUser ?? "", { role: select.value })));
-    document.querySelectorAll("[data-remove-member]").forEach((button) => button.addEventListener("click", () => void removeMember(button.dataset.removeMember ?? "")));
-    document.querySelector("#invite-user-form")?.addEventListener("submit", (event) => void inviteUser(event));
-    document.querySelector("#copy-invite-code")?.addEventListener("click", () => void copyInviteCode());
-    document.querySelector("#regenerate-code")?.addEventListener("click", () => void regenerateInviteCode());
-    document.querySelectorAll("[data-request-approve]").forEach((button) => button.addEventListener("click", () => void respondJoinRequest(button.dataset.requestApprove ?? "", "approve")));
-    document.querySelectorAll("[data-request-decline]").forEach((button) => button.addEventListener("click", () => void respondJoinRequest(button.dataset.requestDecline ?? "", "decline")));
-    document.querySelector("#space-settings-form")?.addEventListener("submit", (event) => void saveSpaceSettings(event));
-    document.querySelector("#delete-space-btn")?.addEventListener("click", () => void deleteSpace());
-    document.querySelector("#ai-settings-form")?.addEventListener("submit", (event) => void saveAISettings(event));
-    document.querySelectorAll("[data-toggle-user]").forEach((button) => button.addEventListener("click", () => void togglePlatformUser(button.dataset.toggleUser ?? "", button.dataset.disabled !== "1")));
-    document.querySelectorAll("[data-reset-password]").forEach((button) => button.addEventListener("click", () => void resetPlatformPassword(button.dataset.resetPassword ?? "")));
-}
-function openModal(modal) {
-    state.modal = modal;
+
+function attachAppHandlers(): void {
+  document.querySelector<HTMLSelectElement>("#space-select")?.addEventListener("change", (event) => void switchSpace((event.target as HTMLSelectElement).value));
+  document.querySelector("#create-space-btn")?.addEventListener("click", () => openModal("createSpace"));
+  document.querySelector("#join-space-btn")?.addEventListener("click", () => openModal("joinSpace"));
+  document.querySelector("#empty-create-space")?.addEventListener("click", () => openModal("createSpace"));
+  document.querySelector("#empty-join-space")?.addEventListener("click", () => openModal("joinSpace"));
+  document.querySelector("#smart-add-btn")?.addEventListener("click", () => { state.draft = null; openModal("smart"); });
+  document.querySelector("#notifications-btn")?.addEventListener("click", () => openModal("notifications"));
+  document.querySelector("#platform-admin-btn")?.addEventListener("click", () => void openPlatformAdmin());
+  document.querySelector("#user-menu-btn")?.addEventListener("click", () => void logout());
+  document.querySelector("#new-event-btn")?.addEventListener("click", () => openEventModal());
+  document.querySelector("#day-add-event")?.addEventListener("click", () => openEventModal());
+  document.querySelector("#space-manage-btn")?.addEventListener("click", () => void openSpaceManage());
+  document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => button.addEventListener("click", () => {
+    state.viewMode = button.dataset.view === "day" ? "day" : "month";
     render();
+  }));
+  document.querySelector("#prev-period")?.addEventListener("click", () => changePeriod(-1));
+  document.querySelector("#next-period")?.addEventListener("click", () => changePeriod(1));
+  document.querySelector("#today-btn")?.addEventListener("click", () => void goToday());
+  document.querySelectorAll<HTMLElement>("[data-member-filter]").forEach((button) => button.addEventListener("click", () => toggleMemberFilter(button.dataset.memberFilter ?? "")));
+  document.querySelectorAll<HTMLElement>("[data-day]").forEach((cell) => cell.addEventListener("click", () => {
+    state.selectedDate = cell.dataset.day ?? state.selectedDate;
+    openModal("dayDetail");
+  }));
+  document.querySelectorAll<HTMLElement>("[data-event-id]").forEach((button) => button.addEventListener("click", () => {
+    const event = state.events.find((item) => item.id === button.dataset.eventId);
+    if (event) openEventModal(event);
+  }));
+  attachModalHandlers();
 }
-function closeModal() {
-    state.modal = null;
-    state.editingEvent = null;
-    state.draft = null;
-    render();
+
+function attachModalHandlers(): void {
+  document.querySelector("#close-modal")?.addEventListener("click", closeModal);
+  document.querySelector("#cancel-modal")?.addEventListener("click", closeModal);
+  document.querySelector<HTMLElement>("[data-close-modal]")?.addEventListener("click", closeModal);
+
+  document.querySelector<HTMLFormElement>("#event-form")?.addEventListener("submit", (event) => void submitEvent(event));
+  document.querySelector<HTMLInputElement>('input[name="allDay"]')?.addEventListener("change", updateTimeFieldState);
+  updateTimeFieldState();
+  document.querySelector("#delete-event-btn")?.addEventListener("click", () => void deleteCurrentEvent());
+
+  document.querySelector<HTMLFormElement>("#smart-form")?.addEventListener("submit", (event) => void submitSmartParse(event));
+  document.querySelector("#clear-draft")?.addEventListener("click", () => { state.draft = null; render(); });
+  document.querySelector("#confirm-draft")?.addEventListener("click", () => void confirmDraft());
+
+  document.querySelector("#open-full-day")?.addEventListener("click", () => { state.viewMode = "day"; closeModal(); });
+  document.querySelector("#detail-add-event")?.addEventListener("click", () => openEventModal());
+
+  document.querySelector<HTMLFormElement>("#create-space-form")?.addEventListener("submit", (event) => void submitCreateSpace(event));
+  document.querySelector<HTMLFormElement>("#join-space-form")?.addEventListener("submit", (event) => void submitJoinSpace(event));
+
+  document.querySelectorAll<HTMLElement>("[data-invite-accept]").forEach((button) => button.addEventListener("click", () => void respondInvitation(button.dataset.inviteAccept ?? "", "accept")));
+  document.querySelectorAll<HTMLElement>("[data-invite-decline]").forEach((button) => button.addEventListener("click", () => void respondInvitation(button.dataset.inviteDecline ?? "", "decline")));
+
+  document.querySelectorAll<HTMLElement>("[data-manage-tab]").forEach((button) => button.addEventListener("click", () => void changeManageTab(button.dataset.manageTab as State["manageTab"])));
+  document.querySelectorAll<HTMLInputElement>("[data-color-user]").forEach((input) => input.addEventListener("change", () => void updateMember(input.dataset.colorUser ?? "", { color: input.value })));
+  document.querySelectorAll<HTMLSelectElement>("[data-role-user]").forEach((select) => select.addEventListener("change", () => void updateMember(select.dataset.roleUser ?? "", { role: select.value as SpaceRole })));
+  document.querySelectorAll<HTMLElement>("[data-remove-member]").forEach((button) => button.addEventListener("click", () => void removeMember(button.dataset.removeMember ?? "")));
+  document.querySelector<HTMLFormElement>("#invite-user-form")?.addEventListener("submit", (event) => void inviteUser(event));
+  document.querySelector("#copy-invite-code")?.addEventListener("click", () => void copyInviteCode());
+  document.querySelector("#regenerate-code")?.addEventListener("click", () => void regenerateInviteCode());
+  document.querySelectorAll<HTMLElement>("[data-request-approve]").forEach((button) => button.addEventListener("click", () => void respondJoinRequest(button.dataset.requestApprove ?? "", "approve")));
+  document.querySelectorAll<HTMLElement>("[data-request-decline]").forEach((button) => button.addEventListener("click", () => void respondJoinRequest(button.dataset.requestDecline ?? "", "decline")));
+  document.querySelector<HTMLFormElement>("#space-settings-form")?.addEventListener("submit", (event) => void saveSpaceSettings(event));
+  document.querySelector("#delete-space-btn")?.addEventListener("click", () => void deleteSpace());
+  document.querySelector<HTMLFormElement>("#ai-settings-form")?.addEventListener("submit", (event) => void saveAISettings(event));
+
+  document.querySelectorAll<HTMLElement>("[data-toggle-user]").forEach((button) => button.addEventListener("click", () => void togglePlatformUser(button.dataset.toggleUser ?? "", button.dataset.disabled !== "1")));
+  document.querySelectorAll<HTMLElement>("[data-reset-password]").forEach((button) => button.addEventListener("click", () => void resetPlatformPassword(button.dataset.resetPassword ?? "")));
 }
-function openEventModal(event = null) {
-    state.editingEvent = event;
-    state.modal = "event";
-    render();
+
+function openModal(modal: ModalName): void {
+  state.modal = modal;
+  render();
 }
-async function switchSpace(spaceId) {
-    if (!spaceId || spaceId === state.activeSpaceId)
-        return;
-    state.activeSpaceId = spaceId;
-    state.visibleMemberIds = new Set();
-    localStorage.setItem("activeSpaceId", spaceId);
-    await loadSpace(spaceId);
-    render();
+
+function closeModal(): void {
+  state.modal = null;
+  state.editingEvent = null;
+  state.draft = null;
+  render();
 }
-function changePeriod(direction) {
-    if (state.viewMode === "day") {
-        const date = parseLocalDate(state.selectedDate);
-        date.setDate(date.getDate() + direction);
-        state.selectedDate = localDateString(date);
-        state.viewYear = date.getFullYear();
-        state.viewMonth = date.getMonth() + 1;
-    }
-    else {
-        const date = new Date(state.viewYear, state.viewMonth - 1 + direction, 1);
-        state.viewYear = date.getFullYear();
-        state.viewMonth = date.getMonth() + 1;
-        state.selectedDate = localDateString(date);
-    }
-    void loadEvents().then(render);
+
+function openEventModal(event: CalendarEvent | null = null): void {
+  state.editingEvent = event;
+  state.modal = "event";
+  render();
 }
-async function goToday() {
-    const date = new Date();
+
+async function switchSpace(spaceId: string): Promise<void> {
+  if (!spaceId || spaceId === state.activeSpaceId) return;
+  state.activeSpaceId = spaceId;
+  state.visibleMemberIds = new Set();
+  localStorage.setItem("activeSpaceId", spaceId);
+  await loadSpace(spaceId);
+  render();
+}
+
+function changePeriod(direction: number): void {
+  if (state.viewMode === "day") {
+    const date = parseLocalDate(state.selectedDate);
+    date.setDate(date.getDate() + direction);
+    state.selectedDate = localDateString(date);
+    state.viewYear = date.getFullYear();
+    state.viewMonth = date.getMonth() + 1;
+  } else {
+    const date = new Date(state.viewYear, state.viewMonth - 1 + direction, 1);
     state.viewYear = date.getFullYear();
     state.viewMonth = date.getMonth() + 1;
     state.selectedDate = localDateString(date);
+  }
+  void loadEvents().then(render);
+}
+
+async function goToday(): Promise<void> {
+  const date = new Date();
+  state.viewYear = date.getFullYear();
+  state.viewMonth = date.getMonth() + 1;
+  state.selectedDate = localDateString(date);
+  await loadEvents();
+  render();
+}
+
+function toggleMemberFilter(memberId: string): void {
+  if (state.visibleMemberIds.has(memberId)) {
+    if (state.visibleMemberIds.size > 1) state.visibleMemberIds.delete(memberId);
+  } else {
+    state.visibleMemberIds.add(memberId);
+  }
+  render();
+}
+
+async function submitEvent(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (!state.activeSpaceId) return;
+  const form = event.currentTarget as HTMLFormElement;
+  const formData = new FormData(form);
+  const allDay = formData.get("allDay") === "on";
+  const assignedUserIds = isSpaceAdmin()
+    ? formData.getAll("assignedUserIds").map(String)
+    : [state.me?.id ?? ""];
+  const payload = {
+    title: formData.get("title"),
+    startDate: formData.get("startDate"),
+    allDay,
+    startTime: allDay ? null : formData.get("startTime"),
+    endTime: allDay ? null : formData.get("endTime"),
+    location: formData.get("location"),
+    companions: formData.get("companions"),
+    notes: formData.get("notes"),
+    assignedUserIds,
+    source: state.editingEvent?.source ?? "manual",
+  };
+  setFormBusy(form, true);
+  try {
+    if (state.editingEvent) {
+      await api(`/api/events/${state.editingEvent.id}`, { method: "PATCH", body: payload });
+      toast("日程已更新");
+    } else {
+      await api(`/api/spaces/${state.activeSpaceId}/events`, { method: "POST", body: payload });
+      toast("日程已创建");
+    }
+    state.modal = null;
+    state.editingEvent = null;
     await loadEvents();
     render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  } finally {
+    setFormBusy(form, false);
+  }
 }
-function toggleMemberFilter(memberId) {
-    if (state.visibleMemberIds.has(memberId)) {
-        if (state.visibleMemberIds.size > 1)
-            state.visibleMemberIds.delete(memberId);
-    }
-    else {
-        state.visibleMemberIds.add(memberId);
-    }
+
+async function deleteCurrentEvent(): Promise<void> {
+  if (!state.editingEvent) return;
+  if (!confirm(`确认删除“${state.editingEvent.title}”吗？`)) return;
+  try {
+    await api(`/api/events/${state.editingEvent.id}`, { method: "DELETE" });
+    toast("日程已删除");
+    state.modal = null;
+    state.editingEvent = null;
+    await loadEvents();
     render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
 }
-async function submitEvent(event) {
-    event.preventDefault();
-    if (!state.activeSpaceId)
-        return;
-    const form = event.currentTarget;
-    const formData = new FormData(form);
-    const allDay = formData.get("allDay") === "on";
-    const assignedUserIds = isSpaceAdmin()
-        ? formData.getAll("assignedUserIds").map(String)
-        : [state.me?.id ?? ""];
-    const payload = {
-        title: formData.get("title"),
-        startDate: formData.get("startDate"),
-        allDay,
-        startTime: allDay ? null : formData.get("startTime"),
-        endTime: allDay ? null : formData.get("endTime"),
-        location: formData.get("location"),
-        companions: formData.get("companions"),
-        notes: formData.get("notes"),
-        assignedUserIds,
-        source: state.editingEvent?.source ?? "manual",
-    };
-    setFormBusy(form, true);
-    try {
-        if (state.editingEvent) {
-            await api(`/api/events/${state.editingEvent.id}`, { method: "PATCH", body: payload });
-            toast("日程已更新");
-        }
-        else {
-            await api(`/api/spaces/${state.activeSpaceId}/events`, { method: "POST", body: payload });
-            toast("日程已创建");
-        }
-        state.modal = null;
-        state.editingEvent = null;
-        await loadEvents();
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-    finally {
-        setFormBusy(form, false);
-    }
+
+async function submitSmartParse(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (!state.activeSpaceId) return;
+  const form = event.currentTarget as HTMLFormElement;
+  const text = String(new FormData(form).get("text") ?? "");
+  setFormBusy(form, true);
+  try {
+    const result = await api<{ draft: EventDraft }>(`/api/spaces/${state.activeSpaceId}/parse`, {
+      method: "POST",
+      body: {
+        text,
+        anchorYear: state.viewYear,
+        anchorMonth: state.viewMonth,
+        referenceDate: localDateString(new Date()),
+      },
+    });
+    state.draft = result.draft;
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  } finally {
+    setFormBusy(form, false);
+  }
 }
-async function deleteCurrentEvent() {
-    if (!state.editingEvent)
-        return;
-    if (!confirm(`确认删除“${state.editingEvent.title}”吗？`))
-        return;
-    try {
-        await api(`/api/events/${state.editingEvent.id}`, { method: "DELETE" });
-        toast("日程已删除");
-        state.modal = null;
-        state.editingEvent = null;
-        await loadEvents();
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
+
+async function confirmDraft(): Promise<void> {
+  if (!state.activeSpaceId || !state.draft) return;
+  const draft = state.draft;
+  try {
+    await api(`/api/spaces/${state.activeSpaceId}/events`, {
+      method: "POST",
+      body: {
+        title: draft.title,
+        startDate: draft.date,
+        startTime: draft.startTime,
+        endTime: draft.endTime,
+        allDay: draft.allDay,
+        location: draft.location,
+        companions: draft.companions,
+        notes: draft.notes,
+        assignedUserIds: draft.assignedUserIds,
+        source: draft.source,
+      },
+    });
+    state.selectedDate = draft.date;
+    const date = parseLocalDate(draft.date);
+    state.viewYear = date.getFullYear();
+    state.viewMonth = date.getMonth() + 1;
+    state.modal = null;
+    state.draft = null;
+    await loadEvents();
+    toast("已加入日历");
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
 }
-async function submitSmartParse(event) {
-    event.preventDefault();
-    if (!state.activeSpaceId)
-        return;
-    const form = event.currentTarget;
-    const text = String(new FormData(form).get("text") ?? "");
-    setFormBusy(form, true);
-    try {
-        const result = await api(`/api/spaces/${state.activeSpaceId}/parse`, {
-            method: "POST",
-            body: {
-                text,
-                anchorYear: state.viewYear,
-                anchorMonth: state.viewMonth,
-                referenceDate: localDateString(new Date()),
-            },
-        });
-        state.draft = result.draft;
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-    finally {
-        setFormBusy(form, false);
-    }
+
+async function submitCreateSpace(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  const form = event.currentTarget as HTMLFormElement;
+  const data = new FormData(form);
+  setFormBusy(form, true);
+  try {
+    const result = await api<{ space: Space }>("/api/spaces", {
+      method: "POST",
+      body: { name: data.get("name"), icon: data.get("icon"), description: data.get("description") },
+    });
+    state.modal = null;
+    await loadBootstrap(result.space.id);
+    toast("空间已创建");
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  } finally {
+    setFormBusy(form, false);
+  }
 }
-async function confirmDraft() {
-    if (!state.activeSpaceId || !state.draft)
-        return;
-    const draft = state.draft;
-    try {
-        await api(`/api/spaces/${state.activeSpaceId}/events`, {
-            method: "POST",
-            body: {
-                title: draft.title,
-                startDate: draft.date,
-                startTime: draft.startTime,
-                endTime: draft.endTime,
-                allDay: draft.allDay,
-                location: draft.location,
-                companions: draft.companions,
-                notes: draft.notes,
-                assignedUserIds: draft.assignedUserIds,
-                source: draft.source,
-            },
-        });
-        state.selectedDate = draft.date;
-        const date = parseLocalDate(draft.date);
-        state.viewYear = date.getFullYear();
-        state.viewMonth = date.getMonth() + 1;
-        state.modal = null;
-        state.draft = null;
-        await loadEvents();
-        toast("已加入日历");
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
+
+async function submitJoinSpace(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  const form = event.currentTarget as HTMLFormElement;
+  const inviteCode = new FormData(form).get("inviteCode");
+  setFormBusy(form, true);
+  try {
+    const result = await api<{ request: { spaceName: string } }>("/api/spaces/join-requests", { method: "POST", body: { inviteCode } });
+    toast(`已申请加入“${result.request.spaceName}”`);
+    closeModal();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  } finally {
+    setFormBusy(form, false);
+  }
 }
-async function submitCreateSpace(event) {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const data = new FormData(form);
-    setFormBusy(form, true);
-    try {
-        const result = await api("/api/spaces", {
-            method: "POST",
-            body: { name: data.get("name"), icon: data.get("icon"), description: data.get("description") },
-        });
-        state.modal = null;
-        await loadBootstrap(result.space.id);
-        toast("空间已创建");
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-    finally {
-        setFormBusy(form, false);
-    }
+
+async function respondInvitation(invitationId: string, decision: "accept" | "decline"): Promise<void> {
+  try {
+    await api(`/api/invitations/${invitationId}/respond`, { method: "POST", body: { decision } });
+    await loadBootstrap();
+    state.modal = state.invitations.length ? "notifications" : null;
+    toast(decision === "accept" ? "已加入空间" : "已拒绝邀请");
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
 }
-async function submitJoinSpace(event) {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const inviteCode = new FormData(form).get("inviteCode");
-    setFormBusy(form, true);
-    try {
-        const result = await api("/api/spaces/join-requests", { method: "POST", body: { inviteCode } });
-        toast(`已申请加入“${result.request.spaceName}”`);
-        closeModal();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-    finally {
-        setFormBusy(form, false);
-    }
+
+async function openSpaceManage(): Promise<void> {
+  state.manageTab = "members";
+  state.modal = "spaceManage";
+  await loadManageData();
+  render();
 }
-async function respondInvitation(invitationId, decision) {
-    try {
-        await api(`/api/invitations/${invitationId}/respond`, { method: "POST", body: { decision } });
-        await loadBootstrap();
-        state.modal = state.invitations.length ? "notifications" : null;
-        toast(decision === "accept" ? "已加入空间" : "已拒绝邀请");
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
+
+async function loadManageData(): Promise<void> {
+  if (!state.activeSpaceId || !isSpaceAdmin()) return;
+  try {
+    const [inviteData, requestData] = await Promise.all([
+      api<{ invitations: ManageInvitation[] }>(`/api/spaces/${state.activeSpaceId}/invitations`),
+      api<{ requests: JoinRequest[] }>(`/api/spaces/${state.activeSpaceId}/join-requests`),
+    ]);
+    state.manageInvitations = inviteData.invitations;
+    state.joinRequests = requestData.requests;
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
 }
-async function openSpaceManage() {
-    state.manageTab = "members";
-    state.modal = "spaceManage";
+
+async function changeManageTab(tab: State["manageTab"]): Promise<void> {
+  state.manageTab = tab;
+  if (tab === "invite") await loadManageData();
+  render();
+}
+
+async function updateMember(userId: string, body: { color?: string; role?: SpaceRole }): Promise<void> {
+  if (!state.activeSpaceId) return;
+  try {
+    const result = await api<{ members: Member[] }>(`/api/spaces/${state.activeSpaceId}/members/${userId}`, { method: "PATCH", body });
+    state.members = result.members;
+    const mine = result.members.find((member) => member.id === state.me?.id);
+    if (mine && state.activeSpace) state.activeSpace.color = mine.color;
+    toast(body.color ? "成员颜色已更新" : "成员角色已更新");
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+    render();
+  }
+}
+
+async function removeMember(userId: string): Promise<void> {
+  if (!state.activeSpaceId) return;
+  const member = state.members.find((item) => item.id === userId);
+  if (!member || !confirm(member.isMe ? "确认退出这个空间吗？" : `确认移除${member.displayName}吗？`)) return;
+  try {
+    await api(`/api/spaces/${state.activeSpaceId}/members/${userId}`, { method: "DELETE" });
+    if (member.isMe) {
+      state.modal = null;
+      await loadBootstrap();
+    } else {
+      await loadSpace(state.activeSpaceId);
+    }
+    toast(member.isMe ? "已退出空间" : "成员已移除");
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
+}
+
+async function inviteUser(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (!state.activeSpaceId) return;
+  const form = event.currentTarget as HTMLFormElement;
+  const username = new FormData(form).get("username");
+  setFormBusy(form, true);
+  try {
+    const result = await api<{ invitation: { inviteeName: string } }>(`/api/spaces/${state.activeSpaceId}/invitations`, { method: "POST", body: { username } });
+    toast(`已邀请${result.invitation.inviteeName}`);
+    form.reset();
     await loadManageData();
     render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  } finally {
+    setFormBusy(form, false);
+  }
 }
-async function loadManageData() {
-    if (!state.activeSpaceId || !isSpaceAdmin())
-        return;
-    try {
-        const [inviteData, requestData] = await Promise.all([
-            api(`/api/spaces/${state.activeSpaceId}/invitations`),
-            api(`/api/spaces/${state.activeSpaceId}/join-requests`),
-        ]);
-        state.manageInvitations = inviteData.invitations;
-        state.joinRequests = requestData.requests;
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
+
+async function copyInviteCode(): Promise<void> {
+  const code = state.activeSpace?.inviteCode;
+  if (!code) return;
+  try {
+    await navigator.clipboard.writeText(code);
+    toast("邀请码已复制");
+  } catch {
+    prompt("请复制邀请码", code);
+  }
 }
-async function changeManageTab(tab) {
-    state.manageTab = tab;
-    if (tab === "invite")
-        await loadManageData();
+
+async function regenerateInviteCode(): Promise<void> {
+  if (!state.activeSpaceId || !confirm("重新生成后，旧邀请码将失效。确认继续吗？")) return;
+  try {
+    const result = await api<{ space: Space }>(`/api/spaces/${state.activeSpaceId}`, { method: "PATCH", body: { regenerateInviteCode: true } });
+    state.activeSpace = result.space;
+    state.spaces = state.spaces.map((space) => space.id === result.space.id ? result.space : space);
+    toast("邀请码已重新生成");
     render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
 }
-async function updateMember(userId, body) {
-    if (!state.activeSpaceId)
-        return;
-    try {
-        const result = await api(`/api/spaces/${state.activeSpaceId}/members/${userId}`, { method: "PATCH", body });
-        state.members = result.members;
-        const mine = result.members.find((member) => member.id === state.me?.id);
-        if (mine && state.activeSpace)
-            state.activeSpace.color = mine.color;
-        toast(body.color ? "成员颜色已更新" : "成员角色已更新");
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-        render();
-    }
+
+async function respondJoinRequest(requestId: string, decision: "approve" | "decline"): Promise<void> {
+  try {
+    await api(`/api/join-requests/${requestId}/respond`, { method: "POST", body: { decision } });
+    await loadManageData();
+    if (state.activeSpaceId) await loadSpace(state.activeSpaceId);
+    toast(decision === "approve" ? "已同意加入申请" : "已拒绝加入申请");
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
 }
-async function removeMember(userId) {
-    if (!state.activeSpaceId)
-        return;
-    const member = state.members.find((item) => item.id === userId);
-    if (!member || !confirm(member.isMe ? "确认退出这个空间吗？" : `确认移除${member.displayName}吗？`))
-        return;
-    try {
-        await api(`/api/spaces/${state.activeSpaceId}/members/${userId}`, { method: "DELETE" });
-        if (member.isMe) {
-            state.modal = null;
-            await loadBootstrap();
-        }
-        else {
-            await loadSpace(state.activeSpaceId);
-        }
-        toast(member.isMe ? "已退出空间" : "成员已移除");
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-}
-async function inviteUser(event) {
-    event.preventDefault();
-    if (!state.activeSpaceId)
-        return;
-    const form = event.currentTarget;
-    const username = new FormData(form).get("username");
-    setFormBusy(form, true);
-    try {
-        const result = await api(`/api/spaces/${state.activeSpaceId}/invitations`, { method: "POST", body: { username } });
-        toast(`已邀请${result.invitation.inviteeName}`);
-        form.reset();
-        await loadManageData();
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-    finally {
-        setFormBusy(form, false);
-    }
-}
-async function copyInviteCode() {
-    const code = state.activeSpace?.inviteCode;
-    if (!code)
-        return;
-    try {
-        await navigator.clipboard.writeText(code);
-        toast("邀请码已复制");
-    }
-    catch {
-        prompt("请复制邀请码", code);
-    }
-}
-async function regenerateInviteCode() {
-    if (!state.activeSpaceId || !confirm("重新生成后，旧邀请码将失效。确认继续吗？"))
-        return;
-    try {
-        const result = await api(`/api/spaces/${state.activeSpaceId}`, { method: "PATCH", body: { regenerateInviteCode: true } });
-        state.activeSpace = result.space;
-        state.spaces = state.spaces.map((space) => space.id === result.space.id ? result.space : space);
-        toast("邀请码已重新生成");
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-}
-async function respondJoinRequest(requestId, decision) {
-    try {
-        await api(`/api/join-requests/${requestId}/respond`, { method: "POST", body: { decision } });
-        await loadManageData();
-        if (state.activeSpaceId)
-            await loadSpace(state.activeSpaceId);
-        toast(decision === "approve" ? "已同意加入申请" : "已拒绝加入申请");
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-}
-async function saveSpaceSettings(event) {
-    event.preventDefault();
-    if (!state.activeSpaceId)
-        return;
-    const form = event.currentTarget;
-    const data = new FormData(form);
-    setFormBusy(form, true);
-    try {
-        const result = await api(`/api/spaces/${state.activeSpaceId}`, {
-            method: "PATCH",
-            body: {
-                name: data.get("name"),
-                icon: data.get("icon"),
-                description: data.get("description"),
-                allowMemberInvites: data.get("allowMemberInvites") === "on",
-            },
-        });
-        state.activeSpace = result.space;
-        state.spaces = state.spaces.map((space) => space.id === result.space.id ? result.space : space);
-        toast("空间设置已保存");
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-    finally {
-        setFormBusy(form, false);
-    }
-}
-async function deleteSpace() {
-    if (!state.activeSpaceId || !state.activeSpace)
-        return;
-    const name = prompt(`请输入空间名称“${state.activeSpace.name}”以确认解散：`);
-    if (name !== state.activeSpace.name)
-        return;
-    try {
-        await api(`/api/spaces/${state.activeSpaceId}`, { method: "DELETE" });
-        state.modal = null;
-        await loadBootstrap();
-        toast("空间已解散");
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-}
-async function saveAISettings(event) {
-    event.preventDefault();
-    if (!state.activeSpaceId)
-        return;
-    const form = event.currentTarget;
-    const data = new FormData(form);
-    setFormBusy(form, true);
-    try {
-        const result = await api(`/api/spaces/${state.activeSpaceId}/ai`, {
-            method: "PUT",
-            body: {
-                enabled: data.get("enabled") === "on",
-                endpoint: data.get("endpoint"),
-                model: data.get("model"),
-                apiKey: data.get("apiKey"),
-            },
-        });
-        state.ai = result.ai;
-        if (state.activeSpace)
-            state.activeSpace.hasAI = result.ai.enabled && result.ai.hasKey;
-        toast("AI 设置已保存");
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-    finally {
-        setFormBusy(form, false);
-    }
-}
-async function openPlatformAdmin() {
-    try {
-        const result = await api("/api/admin/users");
-        state.platformUsers = result.users;
-        state.modal = "platformAdmin";
-        render();
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-}
-async function togglePlatformUser(userId, disabled) {
-    try {
-        await api(`/api/admin/users/${userId}`, { method: "PATCH", body: { disabled } });
-        await openPlatformAdmin();
-        toast(disabled ? "账号已停用" : "账号已恢复");
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-}
-async function resetPlatformPassword(userId) {
-    const password = prompt("输入新密码（至少 6 位）：");
-    if (!password)
-        return;
-    try {
-        await api(`/api/admin/users/${userId}`, { method: "PATCH", body: { password } });
-        toast("密码已重置，该账号需要重新登录");
-    }
-    catch (error) {
-        toast(errorMessage(error), "error");
-    }
-}
-async function logout() {
-    if (!confirm("确认退出当前账号吗？"))
-        return;
-    try {
-        await api("/api/logout", { method: "POST" });
-    }
-    finally {
-        state.me = null;
-        state.spaces = [];
-        state.activeSpace = null;
-        state.activeSpaceId = null;
-        state.modal = null;
-        if (pollTimer !== null)
-            window.clearInterval(pollTimer);
-        render();
-    }
-}
-function updateTimeFieldState() {
-    const allDay = document.querySelector('input[name="allDay"]')?.checked ?? false;
-    document.querySelectorAll(".time-field input").forEach((input) => { input.disabled = allDay; });
-    document.querySelectorAll(".time-field").forEach((field) => field.classList.toggle("disabled", allDay));
-}
-function currentLoadRange() {
-    const monthStart = new Date(state.viewYear, state.viewMonth - 1, 1);
-    const gridStart = startOfCalendarWeek(monthStart);
-    const gridEnd = new Date(gridStart);
-    gridEnd.setDate(gridStart.getDate() + 41);
-    const selected = parseLocalDate(state.selectedDate);
-    const start = selected < gridStart ? selected : gridStart;
-    const end = selected > gridEnd ? selected : gridEnd;
-    return { start: localDateString(start), end: localDateString(end) };
-}
-function monthGridDays(year, month) {
-    const start = startOfCalendarWeek(new Date(year, month - 1, 1));
-    return Array.from({ length: 42 }, (_, index) => new Date(start.getFullYear(), start.getMonth(), start.getDate() + index));
-}
-function startOfCalendarWeek(date) {
-    const weekday = date.getDay() === 0 ? 7 : date.getDay();
-    return new Date(date.getFullYear(), date.getMonth(), date.getDate() - weekday + 1);
-}
-function filteredEventsForDate(date) {
-    return state.events.filter((event) => event.startDate === date && event.assignedUserIds.some((id) => state.visibleMemberIds.has(id)));
-}
-function summarizeByMember(events) {
-    return state.members
-        .filter((member) => state.visibleMemberIds.has(member.id))
-        .map((member) => ({ member, events: events.filter((event) => event.assignedUserIds.includes(member.id)) }))
-        .filter((item) => item.events.length > 0);
-}
-function eventSummary(events) {
-    const first = [...events].sort(eventSort)[0];
-    if (!first)
-        return "";
-    if (events.length === 1)
-        return `${first.allDay ? "全天" : first.startTime ?? ""} ${first.title}`.trim();
-    return `${first.allDay ? "全天" : first.startTime ?? ""} ${first.title} · +${events.length - 1}`.trim();
-}
-function eventSort(a, b) {
-    return Number(b.allDay) - Number(a.allDay) || (a.startTime ?? "00:00").localeCompare(b.startTime ?? "00:00");
-}
-function memberNames(ids) {
-    const names = ids.map((id) => state.members.find((member) => member.id === id)?.displayName).filter(Boolean);
-    return names.length ? names.join("、") : "当前用户";
-}
-function currentMember() {
-    return state.members.find((member) => member.id === state.me?.id) ?? null;
-}
-function isSpaceAdmin() {
-    return state.activeSpace?.role === "owner" || state.activeSpace?.role === "admin";
-}
-function canManageEvent(event) {
-    if (isSpaceAdmin())
-        return true;
-    return event.createdBy === state.me?.id && event.assignedUserIds.length === 1 && event.assignedUserIds[0] === state.me?.id;
-}
-function roleLabel(role) {
-    return role === "owner" ? "所有者" : role === "admin" ? "管理员" : "成员";
-}
-function statusLabel(status) {
-    const map = { pending: "待处理", accepted: "已接受", declined: "已拒绝", cancelled: "已取消", approved: "已同意" };
-    return map[status] ?? status;
-}
-function formatFullDate(value) {
-    const date = parseLocalDate(value);
-    const weekday = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"][date.getDay()];
-    return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ${weekday}`;
-}
-function formatDateTime(value) {
-    const date = new Date(value);
-    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
-}
-function localDateString(date) {
-    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-function parseLocalDate(value) {
-    const [year, month, day] = value.split("-").map(Number);
-    return new Date(year, month - 1, day);
-}
-function timeToMinutes(time) {
-    const [hour, minute] = time.split(":").map(Number);
-    return hour * 60 + minute;
-}
-function addMinutes(time, amount) {
-    const total = Math.min(1439, timeToMinutes(time) + amount);
-    return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
-}
-function initials(name) {
-    return [...name.trim()].slice(-2).join("") || "我";
-}
-function hexToRgba(hex, alpha) {
-    const clean = hex.replace("#", "");
-    const red = Number.parseInt(clean.slice(0, 2), 16);
-    const green = Number.parseInt(clean.slice(2, 4), 16);
-    const blue = Number.parseInt(clean.slice(4, 6), 16);
-    return `rgba(${red},${green},${blue},${alpha})`;
-}
-function escapeHtml(value) {
-    return String(value ?? "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
-}
-function escapeAttr(value) {
-    return escapeHtml(value).replace(/`/g, "&#096;");
-}
-function setFormBusy(form, busy) {
-    form.querySelectorAll("button,input,textarea,select")
-        .forEach((element) => { element.disabled = busy; });
-    form.classList.toggle("is-busy", busy);
-}
-function toast(message, type = "normal") {
-    const root = document.querySelector("#toast-root");
-    if (!root)
-        return;
-    const element = document.createElement("div");
-    element.className = `toast ${type === "error" ? "error" : ""}`;
-    element.textContent = message;
-    root.appendChild(element);
-    window.setTimeout(() => element.remove(), 3200);
-}
-class ApiError extends Error {
-    status;
-    constructor(status, message) {
-        super(message);
-        this.status = status;
-    }
-}
-async function api(path, options = {}) {
-    const response = await fetch(path, {
-        method: options.method ?? "GET",
-        credentials: "same-origin",
-        headers: options.body === undefined ? undefined : { "content-type": "application/json" },
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+
+async function saveSpaceSettings(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (!state.activeSpaceId) return;
+  const form = event.currentTarget as HTMLFormElement;
+  const data = new FormData(form);
+  setFormBusy(form, true);
+  try {
+    const result = await api<{ space: Space }>(`/api/spaces/${state.activeSpaceId}`, {
+      method: "PATCH",
+      body: {
+        name: data.get("name"),
+        icon: data.get("icon"),
+        description: data.get("description"),
+        allowMemberInvites: data.get("allowMemberInvites") === "on",
+      },
     });
-    let payload = null;
-    try {
-        payload = await response.json();
-    }
-    catch {
-        // ignore invalid JSON
-    }
-    if (!response.ok) {
-        const message = payload && typeof payload === "object" && "error" in payload ? String(payload.error) : `请求失败（${response.status}）`;
-        if (response.status === 401 && !options.authOptional) {
-            state.me = null;
-            state.modal = null;
-        }
-        throw new ApiError(response.status, message);
-    }
-    return payload;
+    state.activeSpace = result.space;
+    state.spaces = state.spaces.map((space) => space.id === result.space.id ? result.space : space);
+    toast("空间设置已保存");
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  } finally {
+    setFormBusy(form, false);
+  }
 }
-function errorMessage(error) {
-    return error instanceof Error ? error.message : "操作失败";
+
+async function deleteSpace(): Promise<void> {
+  if (!state.activeSpaceId || !state.activeSpace) return;
+  const name = prompt(`请输入空间名称“${state.activeSpace.name}”以确认解散：`);
+  if (name !== state.activeSpace.name) return;
+  try {
+    await api(`/api/spaces/${state.activeSpaceId}`, { method: "DELETE" });
+    state.modal = null;
+    await loadBootstrap();
+    toast("空间已解散");
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
 }
-function isUnauthorized(error) {
-    return error instanceof ApiError && error.status === 401;
+
+async function saveAISettings(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (!state.activeSpaceId) return;
+  const form = event.currentTarget as HTMLFormElement;
+  const data = new FormData(form);
+  setFormBusy(form, true);
+  try {
+    const result = await api<{ ai: AISettings }>(`/api/spaces/${state.activeSpaceId}/ai`, {
+      method: "PUT",
+      body: {
+        enabled: data.get("enabled") === "on",
+        endpoint: data.get("endpoint"),
+        model: data.get("model"),
+        apiKey: data.get("apiKey"),
+      },
+    });
+    state.ai = result.ai;
+    if (state.activeSpace) state.activeSpace.hasAI = result.ai.enabled && result.ai.hasKey;
+    toast("AI 设置已保存");
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  } finally {
+    setFormBusy(form, false);
+  }
 }
-function registerServiceWorker() {
-    if ("serviceWorker" in navigator) {
-        window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => undefined));
+
+async function openPlatformAdmin(): Promise<void> {
+  try {
+    const result = await api<{ users: PlatformUser[] }>("/api/admin/users");
+    state.platformUsers = result.users;
+    state.modal = "platformAdmin";
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
+}
+
+async function togglePlatformUser(userId: string, disabled: boolean): Promise<void> {
+  try {
+    await api(`/api/admin/users/${userId}`, { method: "PATCH", body: { disabled } });
+    await openPlatformAdmin();
+    toast(disabled ? "账号已停用" : "账号已恢复");
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
+}
+
+async function resetPlatformPassword(userId: string): Promise<void> {
+  const password = prompt("输入新密码（至少 6 位）：");
+  if (!password) return;
+  try {
+    await api(`/api/admin/users/${userId}`, { method: "PATCH", body: { password } });
+    toast("密码已重置，该账号需要重新登录");
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
+}
+
+async function logout(): Promise<void> {
+  if (!confirm("确认退出当前账号吗？")) return;
+  try {
+    await api("/api/logout", { method: "POST" });
+  } finally {
+    state.me = null;
+    state.spaces = [];
+    state.activeSpace = null;
+    state.activeSpaceId = null;
+    state.modal = null;
+    if (pollTimer !== null) window.clearInterval(pollTimer);
+    render();
+  }
+}
+
+function updateTimeFieldState(): void {
+  const allDay = document.querySelector<HTMLInputElement>('input[name="allDay"]')?.checked ?? false;
+  document.querySelectorAll<HTMLInputElement>(".time-field input").forEach((input) => { input.disabled = allDay; });
+  document.querySelectorAll<HTMLElement>(".time-field").forEach((field) => field.classList.toggle("disabled", allDay));
+}
+
+function currentLoadRange(): { start: string; end: string } {
+  const monthStart = new Date(state.viewYear, state.viewMonth - 1, 1);
+  const gridStart = startOfCalendarWeek(monthStart);
+  const gridEnd = new Date(gridStart);
+  gridEnd.setDate(gridStart.getDate() + 41);
+  const selected = parseLocalDate(state.selectedDate);
+  const start = selected < gridStart ? selected : gridStart;
+  const end = selected > gridEnd ? selected : gridEnd;
+  return { start: localDateString(start), end: localDateString(end) };
+}
+
+function monthGridDays(year: number, month: number): Date[] {
+  const start = startOfCalendarWeek(new Date(year, month - 1, 1));
+  return Array.from({ length: 42 }, (_, index) => new Date(start.getFullYear(), start.getMonth(), start.getDate() + index));
+}
+
+function startOfCalendarWeek(date: Date): Date {
+  const weekday = date.getDay() === 0 ? 7 : date.getDay();
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() - weekday + 1);
+}
+
+function filteredEventsForDate(date: string): CalendarEvent[] {
+  return state.events.filter((event) => event.startDate === date && event.assignedUserIds.some((id) => state.visibleMemberIds.has(id)));
+}
+
+function summarizeByMember(events: CalendarEvent[]): Array<{ member: Member; events: CalendarEvent[] }> {
+  return state.members
+    .filter((member) => state.visibleMemberIds.has(member.id))
+    .map((member) => ({ member, events: events.filter((event) => event.assignedUserIds.includes(member.id)) }))
+    .filter((item) => item.events.length > 0);
+}
+
+function eventSummary(events: CalendarEvent[]): string {
+  const first = [...events].sort(eventSort)[0];
+  if (!first) return "";
+  if (events.length === 1) return `${first.allDay ? "全天" : first.startTime ?? ""} ${first.title}`.trim();
+  return `${first.allDay ? "全天" : first.startTime ?? ""} ${first.title} · +${events.length - 1}`.trim();
+}
+
+function eventSort(a: CalendarEvent, b: CalendarEvent): number {
+  return Number(b.allDay) - Number(a.allDay) || (a.startTime ?? "00:00").localeCompare(b.startTime ?? "00:00");
+}
+
+function memberNames(ids: string[]): string {
+  const names = ids.map((id) => state.members.find((member) => member.id === id)?.displayName).filter(Boolean) as string[];
+  return names.length ? names.join("、") : "当前用户";
+}
+
+function currentMember(): Member | null {
+  return state.members.find((member) => member.id === state.me?.id) ?? null;
+}
+
+function isSpaceAdmin(): boolean {
+  return state.activeSpace?.role === "owner" || state.activeSpace?.role === "admin";
+}
+
+function canManageEvent(event: CalendarEvent): boolean {
+  if (isSpaceAdmin()) return true;
+  return event.createdBy === state.me?.id && event.assignedUserIds.length === 1 && event.assignedUserIds[0] === state.me?.id;
+}
+
+function roleLabel(role: SpaceRole): string {
+  return role === "owner" ? "所有者" : role === "admin" ? "管理员" : "成员";
+}
+
+function statusLabel(status: string): string {
+  const map: Record<string, string> = { pending: "待处理", accepted: "已接受", declined: "已拒绝", cancelled: "已取消", approved: "已同意" };
+  return map[status] ?? status;
+}
+
+function formatFullDate(value: string): string {
+  const date = parseLocalDate(value);
+  const weekday = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"][date.getDay()];
+  return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ${weekday}`;
+}
+
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function localDateString(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function parseLocalDate(value: string): Date {
+  const [year, month, day] = value.split("-").map(Number);
+  return new Date(year, month - 1, day);
+}
+
+function timeToMinutes(time: string): number {
+  const [hour, minute] = time.split(":").map(Number);
+  return hour * 60 + minute;
+}
+
+function addMinutes(time: string, amount: number): string {
+  const total = Math.min(1439, timeToMinutes(time) + amount);
+  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function initials(name: string): string {
+  return [...name.trim()].slice(-2).join("") || "我";
+}
+
+function hexToRgba(hex: string, alpha: number): string {
+  const clean = hex.replace("#", "");
+  const red = Number.parseInt(clean.slice(0, 2), 16);
+  const green = Number.parseInt(clean.slice(2, 4), 16);
+  const blue = Number.parseInt(clean.slice(4, 6), 16);
+  return `rgba(${red},${green},${blue},${alpha})`;
+}
+
+function uiIcon(name: "sparkles" | "folderPlus" | "logIn" | "mail" | "settings" | "users" | "logout" | "folder" | "chevronLeft" | "chevronRight" | "calendarPlus" | "palette" | "userPlus" | "sliders" | "bot"): string {
+  const paths: Record<string, string> = {
+    sparkles: '<path d="m12 3-1.2 3.1L8 7.4l2.8 1.3L12 12l1.2-3.3L16 7.4l-2.8-1.3L12 3Z"/><path d="m5 13-.8 2.1L2 16l2.2.9L5 19l.8-2.1L8 16l-2.2-.9L5 13Z"/><path d="m19 12-.6 1.6L17 14l1.4.4L19 16l.6-1.6L21 14l-1.4-.4L19 12Z"/>',
+    folderPlus: '<path d="M3 6.5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6.5Z"/><path d="M12 10v6M9 13h6"/>',
+    logIn: '<path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="m10 8 4 4-4 4M14 12H3"/>',
+    mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/>',
+    settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/>',
+    users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/>',
+    logout: '<path d="M10 17l5-5-5-5M15 12H3"/><path d="M14 3h5a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-5"/>',
+    folder: '<path d="M3 6.5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6.5Z"/>',
+    chevronLeft: '<path d="m15 18-6-6 6-6"/>',
+    chevronRight: '<path d="m9 18 6-6-6-6"/>',
+    calendarPlus: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18M12 14v4M10 16h4"/>',
+    palette: '<path d="M12 3a9 9 0 0 0 0 18h1.2a1.8 1.8 0 0 0 1.4-2.9l-.2-.3a1.8 1.8 0 0 1 1.4-2.9H17a4 4 0 0 0 4-4A8 8 0 0 0 12 3Z"/><circle cx="7.5" cy="10" r=".7"/><circle cx="10" cy="6.8" r=".7"/><circle cx="14" cy="6.8" r=".7"/><circle cx="16.5" cy="10" r=".7"/>',
+    userPlus: '<path d="M15 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8" cy="7" r="4"/><path d="M19 8v6M16 11h6"/>',
+    sliders: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+    bot: '<rect x="4" y="6" width="16" height="13" rx="3"/><path d="M12 2v4M8 11h.01M16 11h.01M8 15h8"/>',
+  };
+  return `<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${paths[name]}</svg>`;
+}
+
+function escapeHtml(value: unknown): string {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function escapeAttr(value: unknown): string {
+  return escapeHtml(value).replace(/`/g, "&#096;");
+}
+
+function setFormBusy(form: HTMLFormElement, busy: boolean): void {
+  form.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("button,input,textarea,select")
+    .forEach((element) => { element.disabled = busy; });
+  form.classList.toggle("is-busy", busy);
+}
+
+function toast(message: string, type: "normal" | "error" = "normal"): void {
+  const root = document.querySelector<HTMLDivElement>("#toast-root");
+  if (!root) return;
+  const element = document.createElement("div");
+  element.className = `toast ${type === "error" ? "error" : ""}`;
+  element.textContent = message;
+  root.appendChild(element);
+  window.setTimeout(() => element.remove(), 3200);
+}
+
+class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+async function api<T = unknown>(
+  path: string,
+  options: { method?: string; body?: unknown; authOptional?: boolean } = {},
+): Promise<T> {
+  const response = await fetch(path, {
+    method: options.method ?? "GET",
+    credentials: "same-origin",
+    headers: options.body === undefined ? undefined : { "content-type": "application/json" },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+  let payload: unknown = null;
+  try {
+    payload = await response.json();
+  } catch {
+    // ignore invalid JSON
+  }
+  if (!response.ok) {
+    const message = payload && typeof payload === "object" && "error" in payload ? String((payload as { error: unknown }).error) : `请求失败（${response.status}）`;
+    if (response.status === 401 && !options.authOptional) {
+      state.me = null;
+      state.modal = null;
     }
+    throw new ApiError(response.status, message);
+  }
+  return payload as T;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "操作失败";
+}
+
+function isUnauthorized(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 401;
+}
+
+function registerServiceWorker(): void {
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => undefined));
+  }
 }
