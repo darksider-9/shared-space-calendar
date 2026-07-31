@@ -246,6 +246,28 @@ interface SpaceContext {
   isAdmin: boolean;
 }
 
+interface CookingPlanTask {
+  id: string;
+  label: string;
+  dish: string;
+  lane: string;
+  startMinute: number;
+  endMinute: number;
+  note: string;
+}
+
+interface CookingPlanResult {
+  source: "ai";
+  serveAt: string;
+  burners: number;
+  startClock: string;
+  totalMinutes: number;
+  summary: string;
+  tips: string[];
+  tasks: CookingPlanTask[];
+}
+
+
 const DATA_KEY = "calendar-data.json";
 const SESSION_COOKIE = "space_calendar_session";
 const SESSION_DAYS = 90;
@@ -1159,6 +1181,25 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     return json({ draft });
   }
 
+  const foodCookingPlanMatch = path.match(/^\/api\/spaces\/([^/]+)\/food\/cooking-plan$/);
+  if (foodCookingPlanMatch && method === "POST") {
+    assertSameOrigin(request);
+    const spaceId = cleanId(foodCookingPlanMatch[1]);
+    const context = requireSpaceContext(authData, user.id, spaceId);
+    if (!context.space.ai?.enabled || !context.space.ai.endpoint || !context.space.ai.model || !context.space.ai.apiKey) {
+      throw new HttpError(409, "当前空间还没有配置 AI，已可继续使用规则烹饪排程");
+    }
+    const body = await readJson<{
+      diners?: number;
+      serveAt?: string;
+      burners?: number;
+      dishes?: unknown[];
+      rulePlan?: unknown;
+    }>(request);
+    const plan = await planCookingWithAI(context, body);
+    return json({ plan });
+  }
+
   const aiMatch = path.match(/^\/api\/spaces\/([^/]+)\/ai$/);
   if (aiMatch && method === "GET") {
     const spaceId = cleanId(aiMatch[1]);
@@ -1948,6 +1989,159 @@ async function parseWithAI(
     source: "ai",
     explanation: "由空间 AI 解析，保存前请确认日期、时间范围、成员和地点。",
   };
+}
+
+async function planCookingWithAI(
+  context: SpaceContext,
+  body: {
+    diners?: number;
+    serveAt?: string;
+    burners?: number;
+    dishes?: unknown[];
+    rulePlan?: unknown;
+  },
+): Promise<CookingPlanResult> {
+  const ai = context.space.ai;
+  if (!ai?.enabled || !ai.apiKey) throw new HttpError(409, "当前空间没有可用的 AI 配置");
+  const diners = normalizeInteger(body.diners, 1, 20) ?? 4;
+  const serveAt = body.serveAt ? normalizeTime(body.serveAt) : "18:30";
+  if (!serveAt) throw new HttpError(400, "开饭时间不正确");
+  const burners = normalizeInteger(body.burners, 1, 4) ?? 2;
+  const dishes = Array.isArray(body.dishes)
+    ? body.dishes.slice(0, 16).map((item, index) => normalizeCookingDish(item, index)).filter(Boolean)
+    : [];
+  if (dishes.length === 0) throw new HttpError(400, "请先生成菜单");
+
+  const rulePlan = normalizeCookingRulePlan(body.rulePlan, serveAt, burners);
+  const prompt = [
+    "你是家庭厨房烹饪排程助手。请在给定规则排程基础上优化顺序和并行关系，只返回合法 JSON，不要输出 Markdown。",
+    `用餐人数：${diners}人；开饭时间：${serveAt}；可用灶台：${burners}个。`,
+    "目标：饭菜尽量同时完成；汤、炖菜、米饭先启动；叶菜和快炒菜临近开饭再做；生熟刀板分开；肉类和水产必须完全熟透。",
+    "不得缩短到低于合理熟制时间，不得让同一个灶台、蒸锅、烤箱或备菜台的任务发生重叠。等待/腌制任务可与其他任务并行。",
+    "返回字段：summary,totalMinutes,startClock,tips,tasks。tasks 每项字段：id,label,dish,lane,startMinute,endMinute,note。startMinute 从开始备菜算起，必须 >=0，endMinute 必须大于 startMinute。",
+    `菜单：${JSON.stringify(dishes)}`,
+    `规则排程：${JSON.stringify(rulePlan)}`,
+  ].join("\n");
+
+  const endpoint = normalizeChatEndpoint(ai.endpoint);
+  const requestBody: Record<string, unknown> = {
+    model: ai.model,
+    messages: [
+      { role: "system", content: "你只输出一个合法 JSON 对象。" },
+      { role: "user", content: prompt },
+    ],
+    temperature: 0.15,
+    response_format: { type: "json_object" },
+  };
+
+  let response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${ai.apiKey}` },
+    body: JSON.stringify(requestBody),
+  });
+  if (!response.ok && response.status === 400) {
+    delete requestBody.response_format;
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${ai.apiKey}` },
+      body: JSON.stringify(requestBody),
+    });
+  }
+  if (!response.ok) throw new HttpError(502, `AI 烹饪排程调用失败（${response.status}）`);
+  const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+  const content = payload.choices?.[0]?.message?.content;
+  if (!content) throw new HttpError(502, "AI 没有返回烹饪排程");
+  const parsed = parseJsonObject(content);
+  if (!parsed) throw new HttpError(502, "AI 烹饪排程不是有效 JSON");
+
+  const tasks = Array.isArray(parsed.tasks)
+    ? parsed.tasks.slice(0, 80).map((item, index) => normalizeCookingTask(item, index)).filter((item): item is CookingPlanTask => Boolean(item))
+    : [];
+  if (tasks.length === 0) throw new HttpError(502, "AI 没有返回有效的烹饪步骤");
+  const maxEnd = Math.max(...tasks.map((task) => task.endMinute));
+  const totalMinutes = normalizeInteger(parsed.totalMinutes, maxEnd, 600) ?? maxEnd;
+  const startClock = safeCookingClock(parsed.startClock) ?? safeCookingClock(rulePlan.startClock) ?? serveAt;
+  const tips = Array.isArray(parsed.tips)
+    ? parsed.tips.slice(0, 8).map((item) => cleanText(item, 180)).filter(Boolean)
+    : [];
+  return {
+    source: "ai",
+    serveAt,
+    burners,
+    startClock,
+    totalMinutes: Math.max(totalMinutes, maxEnd),
+    summary: cleanText(parsed.summary, 320) || "AI 已根据菜品耗时、锅具和开饭时间优化烹饪顺序。",
+    tips: tips.length ? tips : ["按甘特图从上到下准备，快炒菜临近开饭再下锅。"],
+    tasks,
+  };
+}
+
+function normalizeCookingDish(value: unknown, index: number): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const item = value as Record<string, unknown>;
+  const name = cleanText(item.name, 100);
+  if (!name) return null;
+  const steps = Array.isArray(item.steps)
+    ? item.steps.slice(0, 10).map((step) => cleanText(step, 260)).filter(Boolean)
+    : [];
+  return {
+    id: cleanText(item.id, 100) || `dish-${index + 1}`,
+    name,
+    category: cleanText(item.category, 30),
+    equipment: cleanText(item.equipment, 40),
+    prepMinutes: normalizeInteger(item.prepMinutes, 1, 180) ?? 10,
+    cookMinutes: normalizeInteger(item.cookMinutes, 1, 240) ?? 15,
+    passiveMinutes: normalizeInteger(item.passiveMinutes, 0, 240) ?? 0,
+    steps,
+    safety: cleanText(item.safety, 240),
+  };
+}
+
+function normalizeCookingRulePlan(value: unknown, serveAt: string, burners: number): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { serveAt, burners, startClock: serveAt, totalMinutes: 90, tasks: [] };
+  }
+  const input = value as Record<string, unknown>;
+  const tasks = Array.isArray(input.tasks)
+    ? input.tasks.slice(0, 80).map((item, index) => normalizeCookingTask(item, index)).filter(Boolean)
+    : [];
+  const maxEnd = tasks.length ? Math.max(...tasks.map((task) => task?.endMinute ?? 0)) : 90;
+  return {
+    serveAt,
+    burners,
+    startClock: safeCookingClock(input.startClock) ?? serveAt,
+    totalMinutes: normalizeInteger(input.totalMinutes, 1, 600) ?? maxEnd,
+    summary: cleanText(input.summary, 300),
+    tips: Array.isArray(input.tips) ? input.tips.slice(0, 8).map((item) => cleanText(item, 160)).filter(Boolean) : [],
+    tasks,
+  };
+}
+
+function normalizeCookingTask(value: unknown, index: number): CookingPlanTask | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const item = value as Record<string, unknown>;
+  const label = cleanText(item.label, 120);
+  const lane = cleanText(item.lane, 40);
+  const startMinute = normalizeInteger(item.startMinute, 0, 600);
+  const endMinute = normalizeInteger(item.endMinute, 1, 600);
+  if (!label || !lane || startMinute === null || endMinute === null || endMinute <= startMinute) return null;
+  return {
+    id: cleanText(item.id, 100) || `task-${index + 1}`,
+    label,
+    dish: cleanText(item.dish, 100),
+    lane,
+    startMinute,
+    endMinute,
+    note: cleanText(item.note, 240),
+  };
+}
+
+function safeCookingClock(value: unknown): string | null {
+  const raw = String(value ?? "").trim();
+  if (!/^\d{1,2}:\d{2}$/.test(raw)) return null;
+  const [hour, minute] = raw.split(":").map(Number);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
 function parseNaturalDate(
