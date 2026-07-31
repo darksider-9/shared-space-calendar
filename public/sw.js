@@ -1,9 +1,11 @@
-const CACHE = "shared-space-calendar-v3.0";
+const CACHE = "shared-space-calendar-v3.1.0";
 const SHELL = [
   "/",
-  "/styles.css?v=3.0.0",
-  "/assets/main.js?v=3.0.0",
-  "/manifest.webmanifest",
+  "/styles.css?v=3.1.0",
+  "/planner-enhancements.css?v=3.1.0",
+  "/planner-enhancements.js?v=3.1.0",
+  "/assets/main.js?v=3.1.0",
+  "/manifest.webmanifest?v=3.1.0",
   "/icons/icon-192.png",
 ];
 
@@ -27,7 +29,11 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
-  if (url.origin !== location.origin || url.pathname.startsWith("/api/") || event.request.method !== "GET") return;
+  if (
+    url.origin !== location.origin
+    || url.pathname.startsWith("/api/")
+    || event.request.method !== "GET"
+  ) return;
 
   event.respondWith(
     fetch(event.request)
