@@ -22,6 +22,8 @@ interface StoredUser {
   id: string;
   username: string;
   displayName: string;
+  /** 经过前端压缩后的 PNG/JPEG/WebP Data URL。 */
+  avatarDataUrl?: string;
   passwordHash: string;
   isPlatformAdmin: boolean;
   disabled: boolean;
@@ -198,6 +200,7 @@ interface SessionUser {
   id: string;
   username: string;
   displayName: string;
+  avatarDataUrl: string;
   isPlatformAdmin: boolean;
 }
 
@@ -219,6 +222,7 @@ interface PublicMember {
   id: string;
   username: string;
   displayName: string;
+  avatarDataUrl: string;
   role: SpaceRole;
   color: string;
   joinedAt: string;
@@ -442,7 +446,68 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
 
   const { user, data: authData } = await requireUser(request, env);
 
-  if (method === "GET" && path === "/api/me") return json({ user });
+  if (method === "GET" && path === "/api/me") {
+    const stored = requireUserInData(authData, user.id);
+    return json({
+      user: toSessionUser(stored),
+      profile: {
+        createdAt: stored.createdAt,
+        updatedAt: stored.updatedAt,
+        spaceCount: authData.spaceMembers.filter((member) => member.userId === stored.id).length,
+      },
+    });
+  }
+
+  if (method === "PATCH" && path === "/api/me") {
+    assertSameOrigin(request);
+    const body = await readJson<{
+      displayName?: string;
+      avatarDataUrl?: string | null;
+      currentPassword?: string;
+      newPassword?: string;
+    }>(request);
+    const rawToken = getCookie(request, SESSION_COOKIE);
+    const currentTokenHash = rawToken ? await sha256Hex(rawToken) : "";
+    const updated = await mutateData(env, async (data) => {
+      const stored = requireUserInData(data, user.id);
+
+      if (body.displayName !== undefined) {
+        const displayName = cleanText(body.displayName, 30);
+        if (!displayName) throw new HttpError(400, "昵称不能为空");
+        stored.displayName = displayName;
+      }
+
+      if (body.avatarDataUrl !== undefined) {
+        stored.avatarDataUrl = normalizeAvatarDataUrl(body.avatarDataUrl);
+      }
+
+      if (body.newPassword !== undefined && String(body.newPassword).length > 0) {
+        const currentPassword = String(body.currentPassword ?? "");
+        const newPassword = String(body.newPassword);
+        if (!currentPassword) throw new HttpError(400, "请输入当前密码");
+        if (!(await verifyPassword(currentPassword, stored.passwordHash))) {
+          throw new HttpError(400, "当前密码不正确");
+        }
+        if (newPassword.length < 6) throw new HttpError(400, "新密码至少 6 位");
+        if (newPassword === currentPassword) throw new HttpError(400, "新密码不能与当前密码相同");
+        stored.passwordHash = await hashPassword(newPassword);
+        data.sessions = data.sessions.filter(
+          (session) => session.userId !== stored.id || session.tokenHash === currentTokenHash,
+        );
+      }
+
+      stored.updatedAt = new Date().toISOString();
+      return {
+        user: toSessionUser(stored),
+        profile: {
+          createdAt: stored.createdAt,
+          updatedAt: stored.updatedAt,
+          spaceCount: data.spaceMembers.filter((member) => member.userId === stored.id).length,
+        },
+      };
+    });
+    return json(updated);
+  }
 
   if (method === "GET" && path === "/api/bootstrap") {
     return json(buildBootstrap(authData, user.id));
@@ -456,6 +521,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
           id: item.id,
           username: item.username,
           displayName: item.displayName,
+          avatarDataUrl: item.avatarDataUrl ?? "",
           isPlatformAdmin: item.isPlatformAdmin,
           disabled: item.disabled,
           createdAt: item.createdAt,
@@ -1307,6 +1373,7 @@ function publicMembers(data: AppData, context: SpaceContext, currentUserId: stri
         id: account.id,
         username: account.username,
         displayName: account.displayName,
+        avatarDataUrl: account.avatarDataUrl ?? "",
         role: membership.role,
         color: membership.color,
         joinedAt: membership.joinedAt,
@@ -2379,6 +2446,7 @@ function toSessionUser(user: StoredUser): SessionUser {
     id: user.id,
     username: user.username,
     displayName: user.displayName,
+    avatarDataUrl: user.avatarDataUrl ?? "",
     isPlatformAdmin: user.isPlatformAdmin,
   };
 }
@@ -2494,6 +2562,26 @@ function validateAccountInput(username: string, displayName: string, password: s
   if (!/^[a-z0-9_]{3,24}$/.test(username)) throw new HttpError(400, "用户名需要 3–24 位小写字母、数字或下划线");
   if (!displayName) throw new HttpError(400, "请输入显示名称");
   if (password.length < 6) throw new HttpError(400, "密码至少 6 位");
+}
+
+function normalizeAvatarDataUrl(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "";
+  const dataUrl = String(value).trim();
+  if (dataUrl.length > 240_000) {
+    throw new HttpError(413, "头像文件过大，请重新选择较小图片");
+  }
+  if (!/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=\r\n]+$/.test(dataUrl)) {
+    throw new HttpError(400, "头像仅支持 PNG、JPEG 或 WebP 图片");
+  }
+  return dataUrl.replace(/[\r\n]/g, "");
+}
+
+function normalizeStoredAvatar(value: unknown): string {
+  try {
+    return normalizeAvatarDataUrl(value);
+  } catch {
+    return "";
+  }
 }
 
 function normalizeUsername(value: unknown): string {
@@ -2751,7 +2839,10 @@ function sanitizeVersion4(data: AppData): AppData {
   return {
     version: 4,
     revision: Number.isInteger(data.revision) ? data.revision : 0,
-    users: Array.isArray(data.users) ? data.users : [],
+    users: (Array.isArray(data.users) ? data.users : []).map((account) => ({
+      ...account,
+      avatarDataUrl: normalizeStoredAvatar(account.avatarDataUrl),
+    })),
     sessions: Array.isArray(data.sessions) ? data.sessions : [],
     spaces,
     spaceMembers: Array.isArray(data.spaceMembers) ? data.spaceMembers : [],
@@ -2905,6 +2996,7 @@ function migrateData(input: unknown): AppData {
     id: user.id,
     username: normalizeLegacyUsername(user.username, index),
     displayName: user.displayName,
+    avatarDataUrl: "",
     passwordHash: user.passwordHash,
     isPlatformAdmin: Boolean(user.isAdmin) || index === 0,
     disabled: false,
