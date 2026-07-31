@@ -700,3 +700,33 @@
   .map-picker-form footer > div { flex: 1; }
   .map-picker-form footer button { flex: 1; }
 }
+
+/* v3.2：活动库独立、智能地点标点与 AI/规则规划结果 */
+[data-view="map"], #planner-view-btn { display: none !important; }
+.smart-pick-map {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: auto;
+}
+.smart-pick-map svg { width: 16px; height: 16px; }
+.smart-picked-place-note {
+  margin: 0 15px 12px;
+  padding: 9px 11px;
+  border-radius: 11px;
+  color: #34527f;
+  background: rgba(65, 103, 203, .09);
+  border: 1px solid rgba(65, 103, 203, .14);
+  font-size: 10px;
+  line-height: 1.55;
+}
+.result-reason {
+  margin: 10px 0 14px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  color: #68758b;
+  background: rgba(91, 108, 145, .08);
+  font-size: 10px;
+  line-height: 1.65;
+}
+.random-form-grid #plan-preference { min-height: 44px; }
