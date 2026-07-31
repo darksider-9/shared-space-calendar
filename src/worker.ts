@@ -130,8 +130,21 @@ interface StoredPlace {
   updatedAt: string;
 }
 
+interface StoredActivity {
+  id: string;
+  spaceId: string;
+  title: string;
+  category: string;
+  tag: string;
+  notes: string;
+  createdBy: string;
+  likedByUserIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface AppData {
-  version: 3;
+  version: 4;
   revision: number;
   users: StoredUser[];
   sessions: StoredSession[];
@@ -141,6 +154,7 @@ interface AppData {
   joinRequests: StoredJoinRequest[];
   events: StoredEvent[];
   places: StoredPlace[];
+  activities: StoredActivity[];
   updatedAt: string;
 }
 
@@ -615,6 +629,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
         })
         .filter((event) => event.spaceIds.length > 0);
       data.places = data.places.filter((item) => item.spaceId !== spaceId);
+      data.activities = data.activities.filter((item) => item.spaceId !== spaceId);
       return null;
     });
     return json({ ok: true });
@@ -895,6 +910,113 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     return json({ place });
   }
 
+  const activitiesMatch = path.match(/^\/api\/spaces\/([^/]+)\/activities$/);
+  if (activitiesMatch && method === "GET") {
+    const spaceId = cleanId(activitiesMatch[1]);
+    requireSpaceContext(authData, user.id, spaceId);
+    const activities = authData.activities
+      .filter((activity) => activity.spaceId === spaceId)
+      .map((activity) => publicActivity(authData, activity, user.id))
+      .sort((a, b) => b.likeCount - a.likeCount || b.updatedAt.localeCompare(a.updatedAt));
+    return json({ activities, revision: authData.revision });
+  }
+
+  if (activitiesMatch && method === "POST") {
+    assertSameOrigin(request);
+    const spaceId = cleanId(activitiesMatch[1]);
+    const body = await readJson<Record<string, unknown>>(request);
+    const activity = await mutateData(env, (data) => {
+      requireSpaceContext(data, user.id, spaceId);
+      const normalized = normalizeActivityInput(body);
+      const duplicate = data.activities.find(
+        (item) => item.spaceId === spaceId && item.title.localeCompare(normalized.title, "zh-CN", { sensitivity: "base" }) === 0,
+      );
+      if (duplicate) throw new HttpError(409, "这件事情已经在当前空间活动库中");
+      const now = new Date().toISOString();
+      const stored: StoredActivity = {
+        id: crypto.randomUUID(),
+        spaceId,
+        ...normalized,
+        createdBy: user.id,
+        likedByUserIds: [],
+        createdAt: now,
+        updatedAt: now,
+      };
+      data.activities.push(stored);
+      return publicActivity(data, stored, user.id);
+    });
+    return json({ activity }, 201);
+  }
+
+  const activityMatch = path.match(/^\/api\/activities\/([^/]+)$/);
+  if (activityMatch && method === "PATCH") {
+    assertSameOrigin(request);
+    const activityId = cleanId(activityMatch[1]);
+    const body = await readJson<Record<string, unknown>>(request);
+    const activity = await mutateData(env, (data) => {
+      const stored = data.activities.find((item) => item.id === activityId);
+      if (!stored) throw new HttpError(404, "活动不存在");
+      const context = requireSpaceContext(data, user.id, stored.spaceId);
+      if (!context.isAdmin && stored.createdBy !== user.id) throw new HttpError(403, "只能修改自己添加的活动");
+      const normalized = normalizeActivityInput(body, stored);
+      const duplicate = data.activities.find(
+        (item) => item.id !== stored.id && item.spaceId === stored.spaceId
+          && item.title.localeCompare(normalized.title, "zh-CN", { sensitivity: "base" }) === 0,
+      );
+      if (duplicate) throw new HttpError(409, "当前空间已经有同名活动");
+      Object.assign(stored, normalized, { updatedAt: new Date().toISOString() });
+      return publicActivity(data, stored, user.id);
+    });
+    return json({ activity });
+  }
+
+  if (activityMatch && method === "DELETE") {
+    assertSameOrigin(request);
+    const activityId = cleanId(activityMatch[1]);
+    await mutateData(env, (data) => {
+      const stored = data.activities.find((item) => item.id === activityId);
+      if (!stored) throw new HttpError(404, "活动不存在");
+      const context = requireSpaceContext(data, user.id, stored.spaceId);
+      if (!context.isAdmin && stored.createdBy !== user.id) throw new HttpError(403, "只能删除自己添加的活动");
+      data.activities = data.activities.filter((item) => item.id !== activityId);
+      return null;
+    });
+    return json({ ok: true });
+  }
+
+  const activityLikeMatch = path.match(/^\/api\/activities\/([^/]+)\/like$/);
+  if (activityLikeMatch && method === "POST") {
+    assertSameOrigin(request);
+    const activityId = cleanId(activityLikeMatch[1]);
+    const activity = await mutateData(env, (data) => {
+      const stored = data.activities.find((item) => item.id === activityId);
+      if (!stored) throw new HttpError(404, "活动不存在");
+      requireSpaceContext(data, user.id, stored.spaceId);
+      stored.likedByUserIds = stored.likedByUserIds.includes(user.id)
+        ? stored.likedByUserIds.filter((id) => id !== user.id)
+        : [...stored.likedByUserIds, user.id];
+      stored.updatedAt = new Date().toISOString();
+      return publicActivity(data, stored, user.id);
+    });
+    return json({ activity });
+  }
+
+  const plannerRecommendMatch = path.match(/^\/api\/spaces\/([^/]+)\/planner\/recommend$/);
+  if (plannerRecommendMatch && method === "POST") {
+    assertSameOrigin(request);
+    const spaceId = cleanId(plannerRecommendMatch[1]);
+    const context = requireSpaceContext(authData, user.id, spaceId);
+    const body = await readJson<{
+      memberIds?: string[];
+      slots?: Array<{ date?: string; startTime?: string; endTime?: string }>;
+      placeIds?: string[];
+      activities?: Array<{ id?: string; title?: string; category?: string; tag?: string; builtin?: boolean }>;
+      preference?: string;
+    }>(request);
+    const recommendation = await recommendPlan(authData, context, user.id, body);
+    return json({ recommendation });
+  }
+
   const eventsMatch = path.match(/^\/api\/spaces\/([^/]+)\/events$/);
   if (eventsMatch && method === "GET") {
     const spaceId = cleanId(eventsMatch[1]);
@@ -1022,10 +1144,15 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
       ? body.referenceDate
       : localDateString(new Date());
 
-    let draft = parseWithRules(text, anchorYear, anchorMonth, referenceDate, members, user.id, context.isAdmin);
-    if (!draft && context.space.ai?.enabled && context.space.ai.endpoint && context.space.ai.model && context.space.ai.apiKey) {
-      draft = await parseWithAI(text, context, members, user.id, anchorYear, anchorMonth, referenceDate);
+    let draft: EventDraft | null = null;
+    if (context.space.ai?.enabled && context.space.ai.endpoint && context.space.ai.model && context.space.ai.apiKey) {
+      try {
+        draft = await parseWithAI(text, context, members, user.id, anchorYear, anchorMonth, referenceDate);
+      } catch (error) {
+        console.warn("AI parse fallback:", error);
+      }
     }
+    if (!draft) draft = parseWithRules(text, anchorYear, anchorMonth, referenceDate, members, user.id, context.isAdmin);
     if (!draft) {
       throw new HttpError(422, "没有识别到明确日期。可以说“18号”“8月18号”“周日”“下周三”或“下下周五”。");
     }
@@ -1353,6 +1480,310 @@ function publicPlace(data: AppData, place: StoredPlace, currentUserId: string, v
   };
 }
 
+function normalizeActivityInput(body: Record<string, unknown>, existing?: StoredActivity): Pick<StoredActivity,
+  "title" | "category" | "tag" | "notes"
+> {
+  const title = cleanText(body.title ?? existing?.title, 120);
+  if (!title) throw new HttpError(400, "请输入活动名称");
+  return {
+    title,
+    category: cleanText(body.category ?? existing?.category, 40) || "其他",
+    tag: cleanText(body.tag ?? existing?.tag, 40),
+    notes: cleanText(body.notes ?? existing?.notes, 800),
+  };
+}
+
+function publicActivity(data: AppData, activity: StoredActivity, currentUserId: string): StoredActivity & {
+  liked: boolean;
+  likeCount: number;
+  canManage: boolean;
+} {
+  const membership = data.spaceMembers.find(
+    (member) => member.spaceId === activity.spaceId && member.userId === currentUserId,
+  );
+  return {
+    ...activity,
+    likedByUserIds: [...activity.likedByUserIds],
+    liked: activity.likedByUserIds.includes(currentUserId),
+    likeCount: activity.likedByUserIds.length,
+    canManage: Boolean(
+      membership
+      && (membership.role === "owner" || membership.role === "admin" || activity.createdBy === currentUserId)
+    ),
+  };
+}
+
+async function recommendPlan(
+  data: AppData,
+  context: SpaceContext,
+  actorId: string,
+  body: {
+    memberIds?: string[];
+    slots?: Array<{ date?: string; startTime?: string; endTime?: string }>;
+    placeIds?: string[];
+    activities?: Array<{ id?: string; title?: string; category?: string; tag?: string; builtin?: boolean }>;
+    preference?: string;
+  },
+): Promise<{
+  slot: { date: string; startTime: string; endTime: string };
+  place: ReturnType<typeof publicPlace> | null;
+  activity: (ReturnType<typeof publicActivity> | { id: string; title: string; category: string; tag: string; builtin: true }) | null;
+  title: string;
+  reason: string;
+  mode: "rules" | "ai";
+}> {
+  const validMemberIds = new Set(context.members.map((member) => member.userId));
+  let memberIds = Array.isArray(body.memberIds)
+    ? uniqueStrings(body.memberIds.map(String)).filter((id) => validMemberIds.has(id))
+    : [actorId];
+  if (!context.isAdmin) memberIds = [actorId];
+  if (!memberIds.length) memberIds = [actorId];
+
+  const slots = (Array.isArray(body.slots) ? body.slots : [])
+    .slice(0, 60)
+    .map((slot) => {
+      const date = isDateString(String(slot.date ?? "")) ? String(slot.date) : "";
+      const startTime = safeNormalizeTime(slot.startTime);
+      const endTime = safeNormalizeTime(slot.endTime);
+      return date && startTime && endTime && endTime > startTime ? { date, startTime, endTime } : null;
+    })
+    .filter((slot): slot is { date: string; startTime: string; endTime: string } => Boolean(slot));
+  if (!slots.length) throw new HttpError(400, "没有可用于规划的共同空闲时段");
+
+  const requestedPlaceIds = Array.isArray(body.placeIds) ? uniqueStrings(body.placeIds.map(String)) : [];
+  const places = data.places.filter((place) =>
+    placeVisibleInSpace(data, place.id, context.space.id)
+    && (!requestedPlaceIds.length || requestedPlaceIds.includes(place.id))
+  );
+
+  const suppliedActivities = (Array.isArray(body.activities) ? body.activities : []).slice(0, 120);
+  const activities = suppliedActivities.map((candidate, index) => {
+    const id = cleanText(candidate.id, 100) || `client-${index + 1}`;
+    const stored = data.activities.find((activity) => activity.id === id && activity.spaceId === context.space.id);
+    if (stored) return { kind: "stored" as const, value: stored };
+    const title = cleanText(candidate.title, 120);
+    if (!title) return null;
+    return {
+      kind: "builtin" as const,
+      value: {
+        id,
+        title,
+        category: cleanText(candidate.category, 40) || "其他",
+        tag: cleanText(candidate.tag, 40),
+        builtin: true as const,
+      },
+    };
+  }).filter((item): item is NonNullable<typeof item> => Boolean(item));
+
+  const selectedMembers = new Set(memberIds);
+  const placeScore = (place: StoredPlace): number => {
+    const memberLikes = place.likedByUserIds.filter((id) => selectedMembers.has(id)).length;
+    const statusBonus = place.status === "wishlist" ? 2.2 : place.status === "planned" ? 1.3 : 0.8;
+    return 1 + memberLikes * 4 + place.likedByUserIds.length * 0.7 + statusBonus;
+  };
+  const activityScore = (candidate: typeof activities[number]): number => {
+    if (candidate.kind === "builtin") return 1;
+    const memberLikes = candidate.value.likedByUserIds.filter((id) => selectedMembers.has(id)).length;
+    return 1 + memberLikes * 4 + candidate.value.likedByUserIds.length * 0.7;
+  };
+
+  const deterministic = () => {
+    const slot = randomChoiceCrypto(slots);
+    const placeStored = places.length ? weightedRandomCrypto(places, placeScore) : null;
+    const activityCandidate = activities.length ? weightedRandomCrypto(activities, activityScore) : null;
+    const place = placeStored ? publicPlace(data, placeStored, actorId, context.space.id) : null;
+    const activity = activityCandidate
+      ? activityCandidate.kind === "stored"
+        ? publicActivity(data, activityCandidate.value, actorId)
+        : activityCandidate.value
+      : null;
+    const activityTitle = activity?.title ?? "自由安排";
+    const title = place && activity ? `${place.name} · ${activityTitle}` : place?.name ?? activityTitle;
+    return {
+      slot,
+      place,
+      activity,
+      title,
+      reason: buildRuleRecommendationReason(data, context.space.id, memberIds, placeStored, activityCandidate),
+      mode: "rules" as const,
+    };
+  };
+
+  const fallback = deterministic();
+  const ai = context.space.ai;
+  if (!ai?.enabled || !ai.endpoint || !ai.model || !ai.apiKey) return fallback;
+
+  try {
+    const profile = buildPlannerPreferenceProfile(data, context.space.id, memberIds);
+    const slotOptions = slots.slice(0, 30).map((slot, index) => ({ index, ...slot }));
+    const placeOptions = places.slice(0, 30).map((place) => ({
+      id: place.id,
+      name: place.name,
+      category: place.category,
+      status: place.status,
+      votes: place.likedByUserIds.filter((id) => selectedMembers.has(id)).length,
+    }));
+    const activityOptions = activities.slice(0, 50).map((candidate) => candidate.kind === "stored"
+      ? {
+          id: candidate.value.id,
+          title: candidate.value.title,
+          category: candidate.value.category,
+          tag: candidate.value.tag,
+          votes: candidate.value.likedByUserIds.filter((id) => selectedMembers.has(id)).length,
+        }
+      : { ...candidate.value, votes: 0 });
+    const prompt = [
+      "你是私人共享日历中的活动规划助手。请基于共同空闲时间、成员投票和历史偏好，从给定候选中选一个自然、有趣但不过度复杂的计划。",
+      "只能返回 JSON，不得编造候选之外的 slotIndex、placeId 或 activityId。地点和活动都允许为 null。",
+      `成员偏好摘要：${profile}`,
+      `用户补充偏好：${cleanText(body.preference, 240) || "无"}`,
+      `可选时间：${JSON.stringify(slotOptions)}`,
+      `可选地点：${JSON.stringify(placeOptions)}`,
+      `可选活动：${JSON.stringify(activityOptions)}`,
+      '返回字段：{"slotIndex":0,"placeId":"或null","activityId":"或null","title":"计划标题","reason":"一句简短理由"}',
+    ].join("\n");
+    const aiResult = await callAIJson(ai, prompt);
+    const slotIndex = normalizeInteger(aiResult.slotIndex, 0, slotOptions.length - 1) ?? -1;
+    if (slotIndex < 0) return fallback;
+    const placeId = aiResult.placeId == null ? null : cleanText(aiResult.placeId, 100);
+    const activityId = aiResult.activityId == null ? null : cleanText(aiResult.activityId, 100);
+    const placeStored = placeId ? places.find((place) => place.id === placeId) ?? null : null;
+    const activityCandidate = activityId
+      ? activities.find((candidate) => candidate.value.id === activityId) ?? null
+      : null;
+    const place = placeStored ? publicPlace(data, placeStored, actorId, context.space.id) : null;
+    const activity = activityCandidate
+      ? activityCandidate.kind === "stored"
+        ? publicActivity(data, activityCandidate.value, actorId)
+        : activityCandidate.value
+      : null;
+    const defaultTitle = place && activity
+      ? `${place.name} · ${activity.title}`
+      : place?.name ?? activity?.title ?? "一起安排点有意思的事";
+    return {
+      slot: slots[slotIndex],
+      place,
+      activity,
+      title: cleanText(aiResult.title, 100) || defaultTitle,
+      reason: cleanText(aiResult.reason, 240) || "根据共同空闲时间和空间偏好生成。",
+      mode: "ai",
+    };
+  } catch (error) {
+    console.warn("AI planner fallback:", error);
+    return fallback;
+  }
+}
+
+function buildRuleRecommendationReason(
+  data: AppData,
+  spaceId: string,
+  memberIds: string[],
+  place: StoredPlace | null,
+  activity: { kind: "stored"; value: StoredActivity } | { kind: "builtin"; value: { category: string } } | null,
+): string {
+  const memberSet = new Set(memberIds);
+  const parts = ["已避开所选成员现有日程"];
+  if (place) {
+    const votes = place.likedByUserIds.filter((id) => memberSet.has(id)).length;
+    parts.push(votes ? `地点有 ${votes} 位参与成员想去` : place.status === "wishlist" ? "地点来自想去清单" : "地点来自空间地点库");
+  }
+  if (activity?.kind === "stored") {
+    const votes = activity.value.likedByUserIds.filter((id) => memberSet.has(id)).length;
+    parts.push(votes ? `活动有 ${votes} 位参与成员点赞` : "活动来自空间活动库");
+  } else if (activity) {
+    parts.push(`活动来自${activity.value.category}灵感库`);
+  }
+  const pastCount = data.events.filter(
+    (event) => eventSpaceIds(event).includes(spaceId) && event.startDate < localDateString(new Date())
+      && eventAssignments(event, spaceId).some((id) => memberSet.has(id)),
+  ).length;
+  if (pastCount) parts.push("参考了空间过往安排");
+  return `${parts.join("，")}。`;
+}
+
+function buildPlannerPreferenceProfile(data: AppData, spaceId: string, memberIds: string[]): string {
+  const memberSet = new Set(memberIds);
+  const categoryCounts = new Map<string, number>();
+  const add = (category: string, weight = 1) => {
+    const key = cleanText(category, 40) || "其他";
+    categoryCounts.set(key, (categoryCounts.get(key) ?? 0) + weight);
+  };
+  for (const place of data.places.filter((item) => placeVisibleInSpace(data, item.id, spaceId))) {
+    const likes = place.likedByUserIds.filter((id) => memberSet.has(id)).length;
+    if (likes) add(`地点:${place.category}`, likes * 3);
+    if (place.status === "visited") add(`去过:${place.category}`, 1);
+  }
+  for (const activity of data.activities.filter((item) => item.spaceId === spaceId)) {
+    const likes = activity.likedByUserIds.filter((id) => memberSet.has(id)).length;
+    if (likes) add(`活动:${activity.category}`, likes * 3);
+  }
+  const recentTitles = data.events
+    .filter((event) => eventSpaceIds(event).includes(spaceId) && eventAssignments(event, spaceId).some((id) => memberSet.has(id)))
+    .sort((a, b) => b.startDate.localeCompare(a.startDate))
+    .slice(0, 20)
+    .map((event) => event.title);
+  const ranked = [...categoryCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([key]) => key);
+  return `偏好标签：${ranked.join("、") || "暂无明显偏好"}；近期安排：${recentTitles.join("、") || "暂无历史记录"}`;
+}
+
+async function callAIJson(ai: SpaceAISettings, prompt: string): Promise<Record<string, unknown>> {
+  const endpoint = normalizeChatEndpoint(ai.endpoint);
+  const requestBody: Record<string, unknown> = {
+    model: ai.model,
+    messages: [
+      { role: "system", content: "你只输出合法 JSON 对象。" },
+      { role: "user", content: prompt },
+    ],
+    temperature: 0.25,
+    response_format: { type: "json_object" },
+  };
+  let response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${ai.apiKey}` },
+    body: JSON.stringify(requestBody),
+  });
+  if (!response.ok && response.status === 400) {
+    delete requestBody.response_format;
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${ai.apiKey}` },
+      body: JSON.stringify(requestBody),
+    });
+  }
+  if (!response.ok) throw new Error(`AI 接口调用失败（${response.status}）`);
+  const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+  const parsed = parseJsonObject(payload.choices?.[0]?.message?.content ?? "");
+  if (!parsed) throw new Error("AI 返回格式不正确");
+  return parsed;
+}
+
+function safeNormalizeTime(value: unknown): string | null {
+  try {
+    return normalizeTime(value);
+  } catch {
+    return null;
+  }
+}
+
+function randomChoiceCrypto<T>(items: T[]): T {
+  if (!items.length) throw new HttpError(400, "没有可选项");
+  const bytes = crypto.getRandomValues(new Uint32Array(1));
+  return items[bytes[0] % items.length];
+}
+
+function weightedRandomCrypto<T>(items: T[], weight: (item: T) => number): T {
+  if (!items.length) throw new HttpError(400, "没有可选项");
+  const weights = items.map((item) => Math.max(0.01, Number(weight(item)) || 0.01));
+  const total = weights.reduce((sum, value) => sum + value, 0);
+  const random = crypto.getRandomValues(new Uint32Array(1))[0] / 0xffffffff * total;
+  let cursor = random;
+  for (let index = 0; index < items.length; index += 1) {
+    cursor -= weights[index];
+    if (cursor <= 0) return items[index];
+  }
+  return items[items.length - 1];
+}
+
 function placeVisibleInSpace(data: AppData, placeId: string, spaceId: string): boolean {
   const place = data.places.find((item) => item.id === placeId);
   if (!place) return false;
@@ -1446,7 +1877,8 @@ async function parseWithAI(
     permissionText,
     `当前用户：${actor?.displayName ?? actorId}。空间成员：${memberLines}。`,
     "字段：title,date(YYYY-MM-DD),startTime(HH:mm或null),endTime(HH:mm或null),allDay,location,companions,notes,assignedUserIds。",
-    "外部朋友只写进 companions，不要编造用户 ID。没有明确结束时间可设为开始后一小时。",
+    "必须完整理解中文或数字时间。例如‘下午三点到五点’必须返回 startTime=15:00、endTime=17:00；只说开始时间时才默认一小时。",
+    "location 只写地点名称，不要把活动动作混入地点；外部朋友只写进 companions，不要编造用户 ID。",
     `用户输入：${text}`,
   ].join("\n");
 
@@ -1514,7 +1946,7 @@ async function parseWithAI(
     notes: cleanText(parsed.notes, 1200),
     assignedUserIds,
     source: "ai",
-    explanation: "由空间 AI 解析，保存前请确认日期、成员和时间。",
+    explanation: "由空间 AI 解析，保存前请确认日期、时间范围、成员和地点。",
   };
 }
 
@@ -1524,11 +1956,11 @@ function parseNaturalDate(
   anchorMonth: number,
   referenceDate: string,
 ): { date: string; matchedText: string; explanation: string } | null {
-  const fullMatch = text.match(/(?:(\d{4})年)?\s*(\d{1,2})月\s*(\d{1,2})(?:日|号)/);
+  const fullMatch = text.match(/(?:(\d{4}|[二〇零一二三四五六七八九]{4})年)?\s*(\d{1,2}|[一二两三四五六七八九十]{1,3})月\s*(\d{1,2}|[一二两三四五六七八九十]{1,3})(?:日|号)/);
   if (fullMatch) {
-    const year = fullMatch[1] ? Number(fullMatch[1]) : anchorYear;
-    const month = Number(fullMatch[2]);
-    const day = Number(fullMatch[3]);
+    const year = fullMatch[1] ? parseChineseNumber(fullMatch[1]) : anchorYear;
+    const month = parseChineseNumber(fullMatch[2]);
+    const day = parseChineseNumber(fullMatch[3]);
     const date = safeDateString(year, month, day);
     if (!date) throw new HttpError(400, `${year}年${month}月没有${day}号`);
     return {
@@ -1561,9 +1993,9 @@ function parseNaturalDate(
     return { date, matchedText: weekdayMatch[0], explanation: `${weekdayMatch[0]}按${label}定位为 ${date}` };
   }
 
-  const dayOnlyMatch = text.match(/(\d{1,2})(?:日|号)/);
+  const dayOnlyMatch = text.match(/(\d{1,2}|[一二两三四五六七八九十]{1,3})(?:日|号)/);
   if (dayOnlyMatch) {
-    const day = Number(dayOnlyMatch[1]);
+    const day = parseChineseNumber(dayOnlyMatch[1]);
     const date = safeDateString(anchorYear, anchorMonth, day);
     if (!date) throw new HttpError(400, `${anchorYear}年${anchorMonth}月没有${day}号`);
     return {
@@ -1582,36 +2014,61 @@ function parseNaturalTime(text: string): {
   matchedTexts: string[];
   explanation: string;
 } {
-  const timePattern = /(凌晨|早上|上午|中午|下午|傍晚|晚上|夜里)?\s*(\d{1,2})(?:(?:[:：](\d{1,2}))|(?:点|时)(半|(\d{1,2})分?)?)/g;
+  const timePattern = /(凌晨|早上|上午|中午|下午|傍晚|晚上|夜里)?\s*(\d{1,2}|[零〇一二两三四五六七八九十]{1,3})(?:(?:[:：](\d{1,2}))|(?:点|时)(半|一刻|三刻|(?:\d{1,2}|[零〇一二两三四五六七八九十]{1,3})分?)?)/g;
   const matches = [...text.matchAll(timePattern)];
   if (matches.length === 0) return { startTime: null, endTime: null, matchedTexts: [], explanation: "" };
   const firstPeriod = matches[0][1] ?? "";
   const first = parseTimeMatch(matches[0]);
   if (!first) return { startTime: null, endTime: null, matchedTexts: [], explanation: "" };
   let end: string | null = null;
+  let explicitRange = false;
   if (matches.length > 1) {
     const between = text.slice((matches[0].index ?? 0) + matches[0][0].length, matches[1].index ?? 0);
-    if (/到|至|[-—~～]/.test(between)) end = parseTimeMatch(matches[1], firstPeriod);
+    if (/到|至|[-—~～]/.test(between)) {
+      end = parseTimeMatch(matches[1], firstPeriod);
+      explicitRange = Boolean(end);
+    }
   }
   if (!end) end = addMinutesToTime(first, 60);
   return {
     startTime: first,
     endTime: end,
-    matchedTexts: end && matches.length > 1 ? [matches[0][0], matches[1][0]] : [matches[0][0]],
-    explanation: `时间识别为 ${first}${end ? `–${end}` : ""}`,
+    matchedTexts: explicitRange ? [matches[0][0], matches[1][0]] : [matches[0][0]],
+    explanation: explicitRange ? `时间范围识别为 ${first}–${end}` : `开始时间识别为 ${first}，未说结束时间，默认到 ${end}`,
   };
 }
 
 function parseTimeMatch(match: RegExpMatchArray, inheritedPeriod = ""): string | null {
   const period = match[1] ?? inheritedPeriod;
-  let hour = Number(match[2]);
-  const minute = match[3] ? Number(match[3]) : match[4] === "半" ? 30 : match[5] ? Number(match[5]) : 0;
+  let hour = parseChineseNumber(match[2]);
+  let minute = 0;
+  if (match[3]) minute = Number(match[3]);
+  else if (match[4] === "半") minute = 30;
+  else if (match[4] === "一刻") minute = 15;
+  else if (match[4] === "三刻") minute = 45;
+  else if (match[4]) minute = parseChineseNumber(match[4].replace(/分$/, ""));
   if (!Number.isInteger(hour) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
   if (["下午", "傍晚", "晚上", "夜里"].includes(period) && hour < 12) hour += 12;
   if (period === "中午" && hour < 11) hour += 12;
   if (period === "凌晨" && hour === 12) hour = 0;
   if (["早上", "上午"].includes(period) && hour === 12) hour = 0;
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function parseChineseNumber(value: string): number {
+  if (/^\d+$/.test(value)) return Number(value);
+  const digits: Record<string, number> = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  if (/^[二〇零一三四五六七八九]{4}$/.test(value)) {
+    return Number([...value].map((char) => digits[char]).join(""));
+  }
+  if (value === "十") return 10;
+  const tenIndex = value.indexOf("十");
+  if (tenIndex >= 0) {
+    const tens = tenIndex === 0 ? 1 : digits[value[tenIndex - 1]] ?? 0;
+    const ones = tenIndex === value.length - 1 ? 0 : digits[value[tenIndex + 1]] ?? 0;
+    return tens * 10 + ones;
+  }
+  return [...value].reduce((number, char) => number * 10 + (digits[char] ?? 0), 0);
 }
 
 function deriveTitle(
@@ -1627,11 +2084,11 @@ function deriveTitle(
   if (dateMatched) result = result.replace(dateMatched, " ");
   for (const item of timeMatched) result = result.replace(item, " ");
   result = result
-    .replace(/(?:从|到|至)\s*(?:凌晨|早上|上午|中午|下午|傍晚|晚上|夜里)?\s*\d{1,2}(?:[:：点时]\d{0,2})?\s*(?:分)?/g, " ")
+    .replace(/(?:从|到|至)\s*(?:凌晨|早上|上午|中午|下午|傍晚|晚上|夜里)?\s*(?:\d{1,2}|[零〇一二两三四五六七八九十]{1,3})(?:[:：点时](?:\d{0,2}|[零〇一二两三四五六七八九十]{0,3}))?\s*(?:分|半|一刻|三刻)?/g, " ")
     .replace(/(?:地点(?:是|在)?|地址(?:是|在)?)[：:]?\s*[^，。,；;]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  if (location) result = result.replace(new RegExp(`(?:地点(?:是|在)?|地址(?:是|在)?|在)\\s*${escapeRegExp(location)}`), " ");
+  if (location) result = result.replace(new RegExp(`(?:地点(?:是|在)?|地址(?:是|在)?|去|到|在)\\s*${escapeRegExp(location)}`), " ");
   if (companions) result = result.replace(new RegExp(`(?:和|跟|同)\\s*${escapeRegExp(companions)}(?:一起)?`, "g"), " ");
   if (isAdmin) {
     for (const member of members) {
@@ -1653,8 +2110,18 @@ function deriveTitle(
 function extractLocation(text: string): string {
   const explicit = text.match(/(?:地点|地址)(?:是|在)?[：:]?\s*([^，。,；;]+)/);
   if (explicit) return cleanText(explicit[1], 120);
-  const inMatch = text.match(/(?:在|到)([^，。,；;]{2,30})(?:见|集合|碰面|开会|吃饭|看电影|打球|玩|$)/);
-  return inMatch ? cleanText(inMatch[1], 120) : "";
+
+  const actionWords = [
+    "吃饭", "聚餐", "看电影", "看展", "参观", "逛街", "散步", "打球", "健身", "爬山",
+    "露营", "野餐", "野炊", "做饭", "唱歌", "拍照", "开会", "集合", "见面", "碰面", "玩",
+  ];
+  const actionPattern = actionWords.map(escapeRegExp).join("|");
+  const goMatch = text.match(new RegExp(`去\\s*([^，。,；;]{2,50}?)(?=(?:${actionPattern})|[，。,；;]|$)`));
+  const otherMatch = text.match(new RegExp(`(?:在|到)\\s*([^，。,；;]{2,50}?)(?=(?:${actionPattern})|[，。,；;]|$)`));
+  const raw = cleanText(goMatch?.[1] ?? otherMatch?.[1], 120);
+  if (!raw) return "";
+  if (actionWords.some((word) => raw === word || raw === `一起${word}`)) return "";
+  return raw.replace(/^(?:一起|我们|大家)\s*/, "").trim();
 }
 
 function extractExternalCompanions(text: string, members: PublicMember[]): string {
@@ -2056,22 +2523,39 @@ async function loadData(env: Env): Promise<{ data: AppData; migrated: boolean }>
   } catch {
     throw new HttpError(500, "存储中的 calendar-data.json 已损坏");
   }
-  const migrated = !isVersion3(parsed);
-  const data = migrated ? migrateData(parsed) : sanitizeVersion3(parsed as AppData);
+  const migrated = !isVersion4(parsed);
+  const data = migrated ? migrateData(parsed) : sanitizeVersion4(parsed as AppData);
   if (migrated) await writeData(env, data);
   return { data, migrated };
 }
 
-function isVersion3(value: unknown): value is AppData {
-  return Boolean(value && typeof value === "object" && (value as { version?: unknown }).version === 3);
+function isVersion4(value: unknown): value is AppData {
+  return Boolean(value && typeof value === "object" && (value as { version?: unknown }).version === 4);
 }
 
-function sanitizeVersion3(data: AppData): AppData {
+function sanitizeVersion4(data: AppData): AppData {
   const spaces = Array.isArray(data.spaces) ? data.spaces : [];
   const validSpaceIds = new Set(spaces.map((space) => space.id));
   const events = (Array.isArray(data.events) ? data.events : []).map((event) => sanitizeEvent(event, validSpaceIds));
+  const rawPlaces = Array.isArray(data.places) ? data.places : [];
+  const migratedActivities = activityPlacesToActivities(rawPlaces);
+  const places = rawPlaces
+    .filter((place) => !isLegacyActivityPlace(place))
+    .map(sanitizePlace);
+  const activitySource = [
+    ...(Array.isArray(data.activities) ? data.activities : []),
+    ...migratedActivities,
+  ];
+  const activityMap = new Map<string, StoredActivity>();
+  for (const activity of activitySource.map(sanitizeActivity)) {
+    if (validSpaceIds.has(activity.spaceId)) activityMap.set(activity.id, activity);
+  }
+  const validPlaceIds = new Set(places.map((place) => place.id));
+  for (const event of events) {
+    if (event.placeId && !validPlaceIds.has(event.placeId)) event.placeId = null;
+  }
   return {
-    version: 3,
+    version: 4,
     revision: Number.isInteger(data.revision) ? data.revision : 0,
     users: Array.isArray(data.users) ? data.users : [],
     sessions: Array.isArray(data.sessions) ? data.sessions : [],
@@ -2080,18 +2564,53 @@ function sanitizeVersion3(data: AppData): AppData {
     spaceInvitations: Array.isArray(data.spaceInvitations) ? data.spaceInvitations : [],
     joinRequests: Array.isArray(data.joinRequests) ? data.joinRequests : [],
     events,
-    places: (Array.isArray(data.places) ? data.places : []).map((place) => ({
-      ...place,
-      address: place.address ?? "",
-      latitude: Number.isFinite(place.latitude) ? place.latitude : null,
-      longitude: Number.isFinite(place.longitude) ? place.longitude : null,
-      category: place.category || "其他",
-      status: place.status === "planned" ? "planned" : place.status === "visited" ? "visited" : "wishlist",
-      notes: place.notes ?? "",
-      likedByUserIds: Array.isArray(place.likedByUserIds) ? uniqueStrings(place.likedByUserIds) : [],
-    })),
+    places,
+    activities: [...activityMap.values()],
     updatedAt: data.updatedAt || new Date().toISOString(),
   };
+}
+
+function sanitizePlace(place: StoredPlace): StoredPlace {
+  return {
+    ...place,
+    address: place.address ?? "",
+    latitude: Number.isFinite(place.latitude) ? place.latitude : null,
+    longitude: Number.isFinite(place.longitude) ? place.longitude : null,
+    category: place.category || "其他",
+    status: place.status === "planned" ? "planned" : place.status === "visited" ? "visited" : "wishlist",
+    notes: place.notes ?? "",
+    likedByUserIds: Array.isArray(place.likedByUserIds) ? uniqueStrings(place.likedByUserIds) : [],
+  };
+}
+
+function sanitizeActivity(activity: StoredActivity): StoredActivity {
+  return {
+    ...activity,
+    title: cleanText(activity.title, 120) || "未命名活动",
+    category: cleanText(activity.category, 40) || "其他",
+    tag: cleanText(activity.tag, 40),
+    notes: cleanText(activity.notes, 800),
+    likedByUserIds: Array.isArray(activity.likedByUserIds) ? uniqueStrings(activity.likedByUserIds) : [],
+  };
+}
+
+function isLegacyActivityPlace(place: StoredPlace): boolean {
+  return String(place.category ?? "").startsWith("活动库:");
+}
+
+function activityPlacesToActivities(places: StoredPlace[]): StoredActivity[] {
+  return places.filter(isLegacyActivityPlace).map((place) => ({
+    id: place.id,
+    spaceId: place.spaceId,
+    title: place.name,
+    category: String(place.category).replace(/^活动库:/, "") || "其他",
+    tag: place.notes === "空间活动库" ? "" : cleanText(place.notes, 40),
+    notes: place.notes === "空间活动库" ? "" : cleanText(place.notes, 800),
+    createdBy: place.createdBy,
+    likedByUserIds: Array.isArray(place.likedByUserIds) ? uniqueStrings(place.likedByUserIds) : [],
+    createdAt: place.createdAt,
+    updatedAt: place.updatedAt,
+  }));
 }
 
 function sanitizeEvent(event: StoredEvent, validSpaceIds?: Set<string>): StoredEvent {
@@ -2125,6 +2644,38 @@ function sanitizeEvent(event: StoredEvent, validSpaceIds?: Set<string>): StoredE
 
 function migrateData(input: unknown): AppData {
   const source = input && typeof input === "object" ? input as Record<string, unknown> : {};
+
+  if ((source.version === 3 || source.version === 4) && Array.isArray(source.users) && Array.isArray(source.spaces)) {
+    const modern = source as unknown as {
+      version: number;
+      revision?: number;
+      users: StoredUser[];
+      sessions?: StoredSession[];
+      spaces: StoredSpace[];
+      spaceMembers?: StoredSpaceMember[];
+      spaceInvitations?: StoredSpaceInvitation[];
+      joinRequests?: StoredJoinRequest[];
+      events?: StoredEvent[];
+      places?: StoredPlace[];
+      activities?: StoredActivity[];
+      updatedAt?: string;
+    };
+    return sanitizeVersion4({
+      version: 4,
+      revision: Number.isInteger(modern.revision) ? Number(modern.revision) + 1 : 1,
+      users: modern.users,
+      sessions: modern.sessions ?? [],
+      spaces: modern.spaces,
+      spaceMembers: modern.spaceMembers ?? [],
+      spaceInvitations: modern.spaceInvitations ?? [],
+      joinRequests: modern.joinRequests ?? [],
+      events: modern.events ?? [],
+      places: modern.places ?? [],
+      activities: modern.activities ?? [],
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
   if (source.version === 2 && Array.isArray(source.users) && Array.isArray(source.spaces)) {
     const v2 = source as unknown as {
       revision?: number;
@@ -2134,13 +2685,12 @@ function migrateData(input: unknown): AppData {
       spaceMembers?: StoredSpaceMember[];
       spaceInvitations?: StoredSpaceInvitation[];
       joinRequests?: StoredJoinRequest[];
-      events?: Array<StoredEvent & { spaceIds?: string[]; assignmentsBySpace?: Record<string, string[]> }>;
+      events?: StoredEvent[];
       places?: StoredPlace[];
       updatedAt?: string;
     };
-    const validSpaceIds = new Set(v2.spaces.map((space) => space.id));
-    return sanitizeVersion3({
-      version: 3,
+    return sanitizeVersion4({
+      version: 4,
       revision: Number.isInteger(v2.revision) ? Number(v2.revision) + 1 : 1,
       users: v2.users,
       sessions: v2.sessions ?? [],
@@ -2148,8 +2698,9 @@ function migrateData(input: unknown): AppData {
       spaceMembers: v2.spaceMembers ?? [],
       spaceInvitations: v2.spaceInvitations ?? [],
       joinRequests: v2.joinRequests ?? [],
-      events: (v2.events ?? []).map((event) => sanitizeEvent(event as StoredEvent, validSpaceIds)),
+      events: v2.events ?? [],
       places: v2.places ?? [],
+      activities: [],
       updatedAt: new Date().toISOString(),
     });
   }
@@ -2214,7 +2765,7 @@ function migrateData(input: unknown): AppData {
     };
   });
   return {
-    version: 3,
+    version: 4,
     revision: 1,
     users,
     sessions: Array.isArray(legacy.sessions) ? legacy.sessions : [],
@@ -2224,6 +2775,7 @@ function migrateData(input: unknown): AppData {
     joinRequests: [],
     events,
     places: [],
+    activities: [],
     updatedAt: now,
   };
 }
@@ -2240,7 +2792,7 @@ function normalizeLegacyColor(value: string | undefined, index: number): string 
 
 function emptyData(): AppData {
   return {
-    version: 3,
+    version: 4,
     revision: 0,
     users: [],
     sessions: [],
@@ -2250,6 +2802,7 @@ function emptyData(): AppData {
     joinRequests: [],
     events: [],
     places: [],
+    activities: [],
     updatedAt: new Date().toISOString(),
   };
 }
