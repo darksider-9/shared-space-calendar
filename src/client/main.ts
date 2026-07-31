@@ -1,5 +1,7 @@
 type SpaceRole = "owner" | "admin" | "member";
-type ViewMode = "month" | "day";
+type ViewMode = "month" | "day" | "map";
+type PlaceStatus = "wishlist" | "planned" | "visited";
+declare const L: any;
 type ModalName =
   | "event"
   | "smart"
@@ -9,6 +11,7 @@ type ModalName =
   | "notifications"
   | "spaceManage"
   | "platformAdmin"
+  | "place"
   | null;
 
 type User = {
@@ -45,12 +48,18 @@ type Member = {
 type CalendarEvent = {
   id: string;
   spaceId: string;
+  spaceIds: string[];
+  assignmentsBySpace: Record<string, string[]>;
   title: string;
   startDate: string;
   startTime: string | null;
   endTime: string | null;
   allDay: boolean;
   location: string;
+  placeId: string | null;
+  placeAddress: string;
+  latitude: number | null;
+  longitude: number | null;
   companions: string;
   notes: string;
   createdBy: string;
@@ -58,6 +67,43 @@ type CalendarEvent = {
   source: "manual" | "rules" | "ai";
   createdAt: string;
   updatedAt: string;
+};
+
+type Place = {
+  id: string;
+  spaceId: string;
+  name: string;
+  address: string;
+  latitude: number | null;
+  longitude: number | null;
+  category: string;
+  status: PlaceStatus;
+  notes: string;
+  createdBy: string;
+  likedByUserIds: string[];
+  liked: boolean;
+  likeCount: number;
+  relatedEventCount: number;
+  nextEventDate: string | null;
+  isLocal: boolean;
+  canManage: boolean;
+  originSpaceName: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type MapSearchResult = {
+  display_name: string;
+  lat: string;
+  lon: string;
+  type?: string;
+  name?: string;
+};
+
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
 };
 
 type Invitation = {
@@ -128,6 +174,7 @@ type State = {
   activeSpace: Space | null;
   members: Member[];
   events: CalendarEvent[];
+  places: Place[];
   invitations: Invitation[];
   manageInvitations: ManageInvitation[];
   joinRequests: JoinRequest[];
@@ -141,7 +188,15 @@ type State = {
   modal: ModalName;
   manageTab: "members" | "invite" | "settings" | "ai";
   editingEvent: CalendarEvent | null;
+  editingPlace: Place | null;
+  eventPlacePrefill: Place | null;
+  selectedPlaceId: string | null;
+  placeFilter: "all" | PlaceStatus;
+  mapSearchResults: MapSearchResult[];
   draft: EventDraft | null;
+  draftPlace: { name: string; address: string; latitude: number | null; longitude: number | null } | null;
+  chatMessages: ChatMessage[];
+  chatTextParts: string[];
   error: string | null;
   revision: number;
 };
@@ -161,6 +216,7 @@ const state: State = {
   activeSpace: null,
   members: [],
   events: [],
+  places: [],
   invitations: [],
   manageInvitations: [],
   joinRequests: [],
@@ -174,7 +230,15 @@ const state: State = {
   modal: null,
   manageTab: "members",
   editingEvent: null,
+  editingPlace: null,
+  eventPlacePrefill: null,
+  selectedPlaceId: null,
+  placeFilter: "all",
+  mapSearchResults: [],
   draft: null,
+  draftPlace: null,
+  chatMessages: [],
+  chatTextParts: [],
   error: null,
   revision: 0,
 };
@@ -227,6 +291,7 @@ async function loadBootstrap(preferredSpaceId?: string): Promise<void> {
     state.activeSpace = null;
     state.members = [];
     state.events = [];
+    state.places = [];
   }
   startPolling();
 }
@@ -241,7 +306,7 @@ async function loadSpace(spaceId: string): Promise<void> {
   } else {
     state.visibleMemberIds = new Set([...state.visibleMemberIds].filter((id) => data.members.some((member) => member.id === id)));
   }
-  await loadEvents();
+  await Promise.all([loadEvents(), loadPlaces()]);
 }
 
 async function loadEvents(): Promise<void> {
@@ -254,10 +319,21 @@ async function loadEvents(): Promise<void> {
   state.revision = data.revision;
 }
 
+
+async function loadPlaces(): Promise<void> {
+  if (!state.activeSpaceId) return;
+  const data = await api<{ places: Place[]; revision: number }>(`/api/spaces/${state.activeSpaceId}/places`);
+  state.places = data.places;
+  if (!state.selectedPlaceId || !state.places.some((place) => place.id === state.selectedPlaceId)) {
+    state.selectedPlaceId = state.places[0]?.id ?? null;
+  }
+  state.revision = Math.max(state.revision, data.revision);
+}
+
 async function refreshQuietly(): Promise<void> {
   try {
     const beforeRevision = state.revision;
-    await loadEvents();
+    await Promise.all([loadEvents(), loadPlaces()]);
     if (beforeRevision !== state.revision) {
       const bootstrapData = await api<{ user: User; spaces: Space[]; invitations: Invitation[] }>("/api/bootstrap");
       state.spaces = bootstrapData.spaces;
@@ -435,6 +511,7 @@ function renderApp(): void {
     </div>
     ${renderModal()}`;
   attachAppHandlers();
+  if (state.viewMode === "map") window.requestAnimationFrame(initSharedMap);
 }
 
 function renderTopbar(): string {
@@ -495,6 +572,7 @@ function renderTopbar(): string {
           <nav class="view-tabs" aria-label="日历视图">
             <button class="${state.viewMode === "month" ? "active" : ""}" data-view="month">月历</button>
             <button class="${state.viewMode === "day" ? "active" : ""}" data-view="day">日时间轴</button>
+            <button class="${state.viewMode === "map" ? "active" : ""}" data-view="map">共享地图</button>
           </nav>
         </div>
       </div>
@@ -519,11 +597,25 @@ function renderWorkspace(): string {
   return `
     <main class="workspace">
       ${renderCalendarToolbar()}
-      ${state.viewMode === "month" ? renderMonthView() : renderDayView()}
+      ${state.viewMode === "month" ? renderMonthView() : state.viewMode === "day" ? renderDayView() : renderMapView()}
     </main>`;
 }
 
 function renderCalendarToolbar(): string {
+  if (state.viewMode === "map") {
+    return `
+      <section class="calendar-toolbar map-toolbar panel-glass">
+        <div class="date-nav">
+          <div class="date-title">共享地图<small>想去、已计划和共同足迹都集中在这里</small></div>
+        </div>
+        <div class="place-status-tabs">
+          ${(["all", "wishlist", "planned", "visited"] as const).map((status) => `<button class="${state.placeFilter === status ? "active" : ""}" data-place-filter="${status}">${placeStatusLabel(status)}</button>`).join("")}
+        </div>
+        <div class="toolbar-actions">
+          <button class="primary-btn" id="new-place-btn">${uiIcon("mapPin")}<span>添加地点</span></button>
+        </div>
+      </section>`;
+  }
   const monthLabel = `${state.viewYear}年${state.viewMonth}月`;
   const dayLabel = formatFullDate(state.selectedDate);
   return `
@@ -617,6 +709,90 @@ function renderDayView(): string {
     </section>`;
 }
 
+function renderMapView(): string {
+  const places = filteredPlaces();
+  const selected = state.places.find((place) => place.id === state.selectedPlaceId) ?? places[0] ?? null;
+  return `
+    <section class="map-panel panel-glass">
+      <aside class="place-sidebar">
+        <div class="place-summary">
+          <div><strong>${state.places.length}</strong><span>空间地点</span></div>
+          <div><strong>${state.places.filter((place) => place.status === "wishlist").length}</strong><span>想去</span></div>
+          <div><strong>${state.places.filter((place) => place.status === "planned").length}</strong><span>已计划</span></div>
+          <div><strong>${state.places.filter((place) => place.status === "visited").length}</strong><span>去过</span></div>
+        </div>
+        <div class="place-list">
+          ${places.length ? places.map((place) => renderPlaceCard(place, selected?.id === place.id)).join("") : `<div class="empty-state large"><strong>这个分类还没有地点</strong><p>可以先添加想去的地方，之后再一键安排到日历。</p></div>`}
+        </div>
+      </aside>
+      <div class="map-stage">
+        <div id="shared-map" aria-label="共享地点地图"></div>
+        ${selected ? `<div class="map-place-sheet">
+          <div class="place-status-badge status-${selected.status}">${placeStatusLabel(selected.status)}</div>
+          <div class="map-place-copy"><strong>${escapeHtml(selected.name)}</strong><small>${escapeHtml(selected.address || "未填写地址")}</small></div>
+          <div class="inline-actions">
+            <button class="ghost-btn" data-like-place="${selected.id}">${selected.liked ? "♥ 已想去" : "♡ 想去"} · ${selected.likeCount}</button>
+            ${selected.canManage ? `<button class="secondary-btn" data-edit-place="${selected.id}">编辑地点</button>` : `<span class="synced-place-note">来自“${escapeHtml(selected.originSpaceName)}”的同步日程</span>`}
+            <button class="primary-btn" data-plan-place="${selected.id}">再次安排</button>
+          </div>
+        </div>` : `<div class="map-empty-tip">添加带坐标的地点后，会在地图上形成空间的想去清单与共同足迹。</div>`}
+      </div>
+    </section>`;
+}
+
+function renderPlaceCard(place: Place, active: boolean): string {
+  return `<button class="place-card ${active ? "active" : ""}" data-select-place="${place.id}">
+    <span class="place-marker-symbol status-${place.status}">${place.status === "wishlist" ? "☆" : place.status === "planned" ? "▣" : "✓"}</span>
+    <span class="place-card-copy"><strong>${escapeHtml(place.name)}</strong><small>${escapeHtml(place.address || place.category || "未填写地址")}</small><em>${place.isLocal ? "本空间地点" : `来自 ${escapeHtml(place.originSpaceName)}`} · ${place.likeCount} 人想去 · ${place.relatedEventCount} 条关联日程</em></span>
+    <span class="place-card-status">${placeStatusLabel(place.status)}</span>
+  </button>`;
+}
+
+function filteredPlaces(): Place[] {
+  return state.places.filter((place) => state.placeFilter === "all" || place.status === state.placeFilter);
+}
+
+function placeStatusLabel(status: "all" | PlaceStatus): string {
+  return status === "wishlist" ? "想去" : status === "planned" ? "已计划" : status === "visited" ? "去过" : "全部地点";
+}
+
+let leafletMap: any = null;
+function initSharedMap(): void {
+  if (state.viewMode !== "map") return;
+  const container = document.querySelector<HTMLElement>("#shared-map");
+  if (!container || typeof L === "undefined") return;
+  if (leafletMap) {
+    leafletMap.remove();
+    leafletMap = null;
+  }
+  const coordinatePlaces = filteredPlaces().filter((place) => place.latitude !== null && place.longitude !== null);
+  const defaultCenter: [number, number] = coordinatePlaces.length
+    ? [coordinatePlaces[0].latitude as number, coordinatePlaces[0].longitude as number]
+    : [31.2304, 121.4737];
+  leafletMap = L.map(container, { zoomControl: true }).setView(defaultCenter, coordinatePlaces.length ? 12 : 5);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  }).addTo(leafletMap);
+  const bounds: Array<[number, number]> = [];
+  coordinatePlaces.forEach((place) => {
+    const lat = place.latitude as number;
+    const lng = place.longitude as number;
+    bounds.push([lat, lng]);
+    const symbol = place.status === "wishlist" ? "☆" : place.status === "planned" ? "▣" : "✓";
+    const marker = L.marker([lat, lng], {
+      icon: L.divIcon({ className: "shared-place-marker", html: `<span class="status-${place.status}"><i>${symbol}</i></span>`, iconSize: [34, 34], iconAnchor: [17, 17] }),
+    }).addTo(leafletMap);
+    marker.bindTooltip(escapeHtml(place.name), { direction: "top" });
+    marker.on("click", () => {
+      state.selectedPlaceId = place.id;
+      render();
+    });
+  });
+  if (bounds.length > 1) leafletMap.fitBounds(bounds, { padding: [36, 36], maxZoom: 14 });
+  window.setTimeout(() => leafletMap?.invalidateSize(), 80);
+}
+
 function renderMemberTimeline(member: Member, events: CalendarEvent[]): string {
   return `
     <div class="timeline-row">
@@ -653,6 +829,7 @@ function renderModal(): string {
   if (state.modal === "notifications") return renderNotificationsModal();
   if (state.modal === "spaceManage") return renderSpaceManageModal();
   if (state.modal === "platformAdmin") return renderPlatformAdminModal();
+  if (state.modal === "place") return renderPlaceModal();
   return "";
 }
 
@@ -662,32 +839,64 @@ function modalShell(title: string, body: string, className = ""): string {
 
 function renderEventModal(): string {
   const event = state.editingEvent;
+  const prefillPlace = state.eventPlacePrefill;
   const admin = isSpaceAdmin();
   const date = event?.startDate ?? state.selectedDate;
   const assigned = new Set(event?.assignedUserIds ?? [state.me?.id ?? ""]);
+  const linkedSpaces = new Set(event?.spaceIds?.length ? event.spaceIds : [state.activeSpaceId ?? ""]);
   const canDelete = event ? canManageEvent(event) : false;
   const editable = !event || canManageEvent(event);
+  const canChangeSpaces = !event || event.createdBy === state.me?.id;
   const disabled = editable ? "" : "disabled";
+  const selectedPlace = state.places.find((place) => place.id === event?.placeId) ?? prefillPlace;
   return modalShell(event ? "编辑日程" : "新建日程", `
     <form id="event-form" class="modal-body">
       <div class="form-grid">
-        <label class="form-group full">事项名称<input class="field" name="title" required maxlength="100" value="${escapeAttr(event?.title ?? "")}" placeholder="例如：和同学去看电影" ${disabled} /></label>
+        <label class="form-group full">事项名称<input class="field" name="title" required maxlength="100" value="${escapeAttr(event?.title ?? (prefillPlace ? `前往${prefillPlace.name}` : ""))}" placeholder="例如：和同学去看电影" ${disabled} /></label>
         <label class="form-group">日期<input class="field" type="date" name="startDate" required value="${date}" ${disabled} /></label>
         <label class="form-group check-group"><input type="checkbox" name="allDay" ${event?.allDay ?? true ? "checked" : ""} ${disabled} /><span>全天事项</span></label>
         <label class="form-group time-field">开始时间<input class="field" type="time" name="startTime" value="${event?.startTime ?? "09:00"}" ${disabled} /></label>
         <label class="form-group time-field">结束时间<input class="field" type="time" name="endTime" value="${event?.endTime ?? "10:00"}" ${disabled} /></label>
-        <label class="form-group full">地点<input class="field" name="location" maxlength="120" value="${escapeAttr(event?.location ?? "")}" placeholder="可不填" ${disabled} /></label>
+        <div class="form-group full place-event-block">
+          <span class="field-label">地点</span>
+          <div class="event-place-row">
+            <select class="field" name="placeId" id="event-place-select" ${disabled}>
+              <option value="">不关联空间地点</option>
+              ${event?.placeId && !state.places.some((place) => place.id === event.placeId)
+                ? `<option value="${event.placeId}" selected>同步地点：${escapeHtml(event.location || "其他空间地点")}</option>`
+                : ""}
+              ${state.places.map((place) => `<option value="${place.id}" ${place.id === (event?.placeId ?? prefillPlace?.id) ? "selected" : ""}>${escapeHtml(place.name)} · ${placeStatusLabel(place.status)}${place.isLocal ? "" : ` · 来自${escapeHtml(place.originSpaceName)}`}</option>`).join("")}
+            </select>
+            <button class="secondary-btn" type="button" id="open-map-from-event" ${editable ? "" : "disabled"}>打开共享地图</button>
+          </div>
+          <input class="field" name="location" maxlength="120" value="${escapeAttr(event?.location ?? selectedPlace?.name ?? "")}" placeholder="地点名称，也可以直接手动填写" ${disabled} />
+          <input class="field" name="placeAddress" maxlength="240" value="${escapeAttr(event?.placeAddress ?? selectedPlace?.address ?? "")}" placeholder="具体地址（可不填）" ${disabled} />
+          <input type="hidden" name="latitude" value="${event?.latitude ?? selectedPlace?.latitude ?? ""}" />
+          <input type="hidden" name="longitude" value="${event?.longitude ?? selectedPlace?.longitude ?? ""}" />
+        </div>
         <label class="form-group full">外部同行人<input class="field" name="companions" maxlength="160" value="${escapeAttr(event?.companions ?? "")}" placeholder="例如：高中同学小李（不需要平台账号）" ${disabled} /></label>
         <label class="form-group full">备注<textarea class="field" name="notes" maxlength="1200" ${disabled}>${escapeHtml(event?.notes ?? "")}</textarea></label>
         <div class="form-group full"><span class="field-label">日程归属成员</span>
           ${admin ? `<div class="member-select-grid">${state.members.map((member) => `<label class="member-option" style="--member:${member.color}"><input type="checkbox" name="assignedUserIds" value="${member.id}" ${assigned.has(member.id) ? "checked" : ""} ${editable ? "" : "disabled"} /><i></i><span>${escapeHtml(member.displayName)}</span></label>`).join("")}</div>` : `<div class="permission-box"><i style="background:${currentMember()?.color ?? "#697386"}"></i>普通成员只能直接给自己创建和管理日程。</div>`}
         </div>
+        <div class="form-group full sync-space-block"><span class="field-label">同步到其他空间</span>
+          <p class="field-help">只保存一条事件；以后修改时间、标题或地点，会在选中的所有空间同步更新。</p>
+          <div class="space-sync-grid">${state.spaces.map((space) => {
+            const checked = linkedSpaces.has(space.id) || space.id === state.activeSpaceId;
+            const locked = space.id === state.activeSpaceId || !canChangeSpaces || !editable;
+            return `<label class="space-sync-option ${checked ? "selected" : ""}"><input type="checkbox" name="spaceIds" value="${space.id}" ${checked ? "checked" : ""} ${locked ? "disabled" : ""} /><span class="space-sync-icon">${escapeHtml(space.icon)}</span><span><strong>${escapeHtml(space.name)}</strong><small>${space.id === state.activeSpaceId ? "当前空间" : roleLabel(space.role)}</small></span></label>`;
+          }).join("")}</div>
+          ${!canChangeSpaces && event ? `<div class="soft-note">只有这条日程的创建者可以增加或取消同步空间；空间管理员仍可修改当前空间中的日程内容。</div>` : ""}
+        </div>
       </div>
       <footer class="modal-actions">
-        <div>${canDelete ? `<button type="button" class="danger-btn" id="delete-event-btn">删除</button>` : ""}</div>
-        <div class="inline-actions"><button type="button" class="ghost-btn" id="cancel-modal">${editable ? "取消" : "关闭"}</button>${editable ? `<button type="submit" class="primary-btn">${event ? "保存修改" : "创建日程"}</button>` : ""}</div>
+        <div>${canDelete ? event && event.spaceIds.length > 1
+          ? `<button type="button" class="danger-btn soft-danger" id="detach-event-btn">仅从当前空间移除</button>${event.createdBy === state.me?.id ? `<button type="button" class="danger-btn" id="delete-event-btn">从全部空间彻底删除</button>` : ""}`
+          : `<button type="button" class="danger-btn" id="detach-event-btn">删除</button>`
+        : ""}</div>
+        <div class="inline-actions"><button type="button" class="ghost-btn" id="cancel-modal">${editable ? "取消" : "关闭"}</button>${editable ? `<button type="submit" class="primary-btn">${event ? "保存并同步" : "创建日程"}</button>` : ""}</div>
       </footer>
-    </form>`);
+    </form>`, "wide-modal");
 }
 
 function renderSmartModal(): string {
@@ -695,30 +904,37 @@ function renderSmartModal(): string {
   const examples = isSpaceAdmin()
     ? "例如：8月18号下午2点到4点，给小王和小李安排项目讨论，地点会议室A"
     : "例如：18号晚上7点和小李看电影；下周三下午3点去健身";
-  return modalShell("智能添加日程", `
-    <div class="modal-body smart-body">
-      <div class="smart-intro"><span>✦</span><div><strong>${state.ai?.enabled ? "规则识别 + 空间 AI" : "轻量规则识别"}</strong><p>${isSpaceAdmin() ? "你是空间管理员，可以为多个成员分配日程。" : "你是普通成员，系统只会给你本人创建日程。"}</p></div></div>
-      <form id="smart-form" class="smart-input-row">
+  const messages = state.chatMessages.length
+    ? state.chatMessages
+    : [{ id: "welcome", role: "assistant" as const, text: `说一句完整或不完整的话都可以。${isSpaceAdmin() ? "你可以为当前空间的多位成员安排日程。" : "普通成员创建的日程只会直接归属自己。"}` }];
+  return modalShell("AI 日程助手", `
+    <div class="modal-body smart-body chat-smart-body">
+      <div class="smart-intro"><span>${uiIcon("sparkles")}</span><div><strong>${state.ai?.enabled ? "规则识别 + 空间 AI" : "免费规则识别"}</strong><p>当前空间：${escapeHtml(state.activeSpace?.name ?? "")}。系统会先生成草稿，确认后才写入日历。</p></div></div>
+      <div class="chat-thread" id="chat-thread">${messages.map((message) => `<div class="chat-message ${message.role}"><span>${message.role === "user" ? escapeHtml(initials(state.me?.displayName ?? "我")) : "AI"}</span><p>${escapeHtml(message.text)}</p></div>`).join("")}</div>
+      ${draft ? renderDraftPreview(draft) : ""}
+      <form id="smart-form" class="chat-compose">
         <textarea class="field" name="text" required maxlength="500" placeholder="${escapeAttr(examples)}"></textarea>
-        <button class="primary-btn" type="submit">识别</button>
+        <button class="primary-btn" type="submit">发送并识别</button>
       </form>
-      <div class="rule-hints">支持任意有效“几号”、几月几号、今天/明天/后天、周几、下周几、下下周几，以及上午/下午/晚上具体时间。</div>
-      ${draft ? renderDraftPreview(draft) : `<div class="smart-empty"><i>⌁</i><p>输入一句自然语言，系统先生成预览，确认后才会写入日历。</p></div>`}
-    </div>`);
+      <div class="rule-hints">支持任意有效几号、几月几号、今天/明天/后天、周几、下周几、下下周几。信息不完整时可以继续补一句。</div>
+    </div>`, "wide-modal smart-modal");
 }
 
 function renderDraftPreview(draft: EventDraft): string {
-  return `<section class="draft-card">
+  const candidateResults = state.mapSearchResults.slice(0, 5);
+  return `<section class="draft-card chat-draft-card">
     <div class="draft-source"><span>${draft.source === "ai" ? "AI" : "规则"}</span>${escapeHtml(draft.explanation)}</div>
     <div class="draft-title">${escapeHtml(draft.title)}</div>
     <dl>
       <dt>日期</dt><dd>${formatFullDate(draft.date)}</dd>
       <dt>时间</dt><dd>${draft.allDay ? "全天" : `${draft.startTime ?? ""}–${draft.endTime ?? ""}`}</dd>
       <dt>成员</dt><dd>${escapeHtml(memberNames(draft.assignedUserIds))}</dd>
-      <dt>地点</dt><dd>${escapeHtml(draft.location || "未填写")}</dd>
+      <dt>地点</dt><dd>${escapeHtml(state.draftPlace?.name || draft.location || "未填写")}${state.draftPlace?.address ? `<small>${escapeHtml(state.draftPlace.address)}</small>` : ""}</dd>
       <dt>外部同行人</dt><dd>${escapeHtml(draft.companions || "未填写")}</dd>
     </dl>
-    <div class="inline-actions end"><button class="ghost-btn" id="clear-draft">重新输入</button><button class="primary-btn" id="confirm-draft">确认加入日历</button></div>
+    ${draft.location && candidateResults.length ? `<div class="draft-place-candidates"><strong>请选择准确地点</strong>${candidateResults.map((result, index) => `<button type="button" class="${state.draftPlace?.latitude === Number(result.lat) && state.draftPlace?.longitude === Number(result.lon) ? "selected" : ""}" data-draft-map-result="${index}"><span>${escapeHtml(result.name || result.display_name.split(",")[0])}</span><small>${escapeHtml(result.display_name)}</small></button>`).join("")}</div>` : ""}
+    <div class="draft-space-sync"><strong>同时显示到这些空间</strong><div class="space-sync-grid compact">${state.spaces.map((space) => `<label class="space-sync-option ${space.id === state.activeSpaceId ? "selected" : ""}"><input type="checkbox" name="draftSpaceIds" value="${space.id}" ${space.id === state.activeSpaceId ? "checked disabled" : ""}/><span class="space-sync-icon">${escapeHtml(space.icon)}</span><span><strong>${escapeHtml(space.name)}</strong><small>${space.id === state.activeSpaceId ? "当前空间" : "同步副本"}</small></span></label>`).join("")}</div></div>
+    <div class="inline-actions end"><button class="ghost-btn" id="clear-draft">清空对话</button><button class="primary-btn" id="confirm-draft">确认创建并同步</button></div>
   </section>`;
 }
 
@@ -758,6 +974,29 @@ function renderJoinSpaceModal(): string {
       <div class="soft-note">通过申请后，你才能看到该空间的成员与共享日程。不同空间之间的数据不会混在一起。</div>
       <div class="modal-actions end"><button type="button" class="ghost-btn" id="cancel-modal">取消</button><button class="primary-btn" type="submit">提交加入申请</button></div>
     </form>`);
+}
+
+function renderPlaceModal(): string {
+  const place = state.editingPlace;
+  return modalShell(place ? "编辑空间地点" : "添加空间地点", `
+    <form id="place-form" class="modal-body place-form">
+      <div class="modal-guide">${uiIcon("mapPin")}<div><strong>把地点加入当前空间的共享地图</strong><p>地点可以先放入想去清单，也可以直接安排到日历，之后会形成共同足迹。</p></div></div>
+      <div class="place-search-box">
+        <label>地图搜索<div class="smart-input-row"><input class="field" id="place-search-query" placeholder="输入地点、景点或完整地址" /><button class="secondary-btn" type="button" id="search-place-btn">搜索地图</button></div></label>
+        <div class="search-provider-note">地点搜索由 OpenStreetMap Nominatim 提供；只在点击搜索时请求，不做自动联想。</div>
+        <div id="place-search-results" class="place-search-results">${state.mapSearchResults.map((result, index) => `<button type="button" data-map-result="${index}"><strong>${escapeHtml(result.name || result.display_name.split(",")[0])}</strong><small>${escapeHtml(result.display_name)}</small></button>`).join("")}</div>
+      </div>
+      <div class="form-grid">
+        <label class="form-group full">地点名称<input class="field" name="name" required maxlength="120" value="${escapeAttr(place?.name ?? "")}" placeholder="例如：苏州博物馆" /></label>
+        <label class="form-group full">具体地址<input class="field" name="address" maxlength="240" value="${escapeAttr(place?.address ?? "")}" placeholder="搜索后会自动填入，也可以手动修改" /></label>
+        <label class="form-group">分类<select class="field" name="category">${["餐饮", "景点", "运动", "购物", "交通", "住宿", "其他"].map((category) => `<option ${category === (place?.category ?? "其他") ? "selected" : ""}>${category}</option>`).join("")}</select></label>
+        <label class="form-group">状态<select class="field" name="status"><option value="wishlist" ${place?.status === "wishlist" || !place ? "selected" : ""}>想去</option><option value="planned" ${place?.status === "planned" ? "selected" : ""}>已计划</option><option value="visited" ${place?.status === "visited" ? "selected" : ""}>去过</option></select></label>
+        <label class="form-group">纬度<input class="field" name="latitude" inputmode="decimal" value="${place?.latitude ?? ""}" placeholder="搜索后自动填入" /></label>
+        <label class="form-group">经度<input class="field" name="longitude" inputmode="decimal" value="${place?.longitude ?? ""}" placeholder="搜索后自动填入" /></label>
+        <label class="form-group full">备注<textarea class="field" name="notes" maxlength="800" placeholder="例如：适合周末下午，最好提前预约">${escapeHtml(place?.notes ?? "")}</textarea></label>
+      </div>
+      <footer class="modal-actions"><div>${place ? `<button class="danger-btn" id="delete-place-btn" type="button">删除地点</button>` : ""}</div><div class="inline-actions"><button type="button" class="ghost-btn" id="cancel-modal">取消</button><button class="primary-btn" type="submit">${place ? "保存地点" : "加入共享地图"}</button></div></footer>
+    </form>`, "wide-modal");
 }
 
 function renderNotificationsModal(): string {
@@ -843,15 +1082,36 @@ function attachAppHandlers(): void {
   document.querySelector("#join-space-btn")?.addEventListener("click", () => openModal("joinSpace"));
   document.querySelector("#empty-create-space")?.addEventListener("click", () => openModal("createSpace"));
   document.querySelector("#empty-join-space")?.addEventListener("click", () => openModal("joinSpace"));
-  document.querySelector("#smart-add-btn")?.addEventListener("click", () => { state.draft = null; openModal("smart"); });
+  document.querySelector("#smart-add-btn")?.addEventListener("click", () => {
+    state.draft = null;
+    state.draftPlace = null;
+    state.mapSearchResults = [];
+    state.chatMessages = [];
+    state.chatTextParts = [];
+    openModal("smart");
+  });
   document.querySelector("#notifications-btn")?.addEventListener("click", () => openModal("notifications"));
   document.querySelector("#platform-admin-btn")?.addEventListener("click", () => void openPlatformAdmin());
   document.querySelector("#user-menu-btn")?.addEventListener("click", () => void logout());
   document.querySelector("#new-event-btn")?.addEventListener("click", () => openEventModal());
   document.querySelector("#day-add-event")?.addEventListener("click", () => openEventModal());
   document.querySelector("#space-manage-btn")?.addEventListener("click", () => void openSpaceManage());
+  document.querySelector("#new-place-btn")?.addEventListener("click", () => openPlaceModal());
+  document.querySelectorAll<HTMLElement>("[data-place-filter]").forEach((button) => button.addEventListener("click", () => {
+    const value = button.dataset.placeFilter;
+    state.placeFilter = value === "wishlist" || value === "planned" || value === "visited" ? value : "all";
+    render();
+  }));
+  document.querySelectorAll<HTMLElement>("[data-select-place]").forEach((button) => button.addEventListener("click", () => {
+    state.selectedPlaceId = button.dataset.selectPlace ?? null;
+    render();
+  }));
+  document.querySelectorAll<HTMLElement>("[data-edit-place]").forEach((button) => button.addEventListener("click", () => openPlaceModal(state.places.find((place) => place.id === button.dataset.editPlace) ?? null)));
+  document.querySelectorAll<HTMLElement>("[data-plan-place]").forEach((button) => button.addEventListener("click", () => planPlace(button.dataset.planPlace ?? "")));
+  document.querySelectorAll<HTMLElement>("[data-like-place]").forEach((button) => button.addEventListener("click", () => void togglePlaceLike(button.dataset.likePlace ?? "")));
   document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => button.addEventListener("click", () => {
-    state.viewMode = button.dataset.view === "day" ? "day" : "month";
+    const view = button.dataset.view;
+    state.viewMode = view === "day" ? "day" : view === "map" ? "map" : "month";
     render();
   }));
   document.querySelector("#prev-period")?.addEventListener("click", () => changePeriod(-1));
@@ -877,14 +1137,35 @@ function attachModalHandlers(): void {
   document.querySelector<HTMLFormElement>("#event-form")?.addEventListener("submit", (event) => void submitEvent(event));
   document.querySelector<HTMLInputElement>('input[name="allDay"]')?.addEventListener("change", updateTimeFieldState);
   updateTimeFieldState();
-  document.querySelector("#delete-event-btn")?.addEventListener("click", () => void deleteCurrentEvent());
+  document.querySelector("#delete-event-btn")?.addEventListener("click", () => void deleteCurrentEvent("all"));
+  document.querySelector("#detach-event-btn")?.addEventListener("click", () => void deleteCurrentEvent("detach"));
+  document.querySelector<HTMLSelectElement>("#event-place-select")?.addEventListener("change", syncSelectedPlaceIntoEventForm);
+  document.querySelector("#open-map-from-event")?.addEventListener("click", () => {
+    state.modal = null;
+    state.editingEvent = null;
+    state.viewMode = "map";
+    render();
+  });
 
   document.querySelector<HTMLFormElement>("#smart-form")?.addEventListener("submit", (event) => void submitSmartParse(event));
-  document.querySelector("#clear-draft")?.addEventListener("click", () => { state.draft = null; render(); });
+  document.querySelector("#clear-draft")?.addEventListener("click", () => {
+    state.draft = null;
+    state.draftPlace = null;
+    state.mapSearchResults = [];
+    state.chatMessages = [];
+    state.chatTextParts = [];
+    render();
+  });
   document.querySelector("#confirm-draft")?.addEventListener("click", () => void confirmDraft());
+  document.querySelectorAll<HTMLElement>("[data-draft-map-result]").forEach((button) => button.addEventListener("click", () => selectDraftMapResult(Number(button.dataset.draftMapResult))));
 
   document.querySelector("#open-full-day")?.addEventListener("click", () => { state.viewMode = "day"; closeModal(); });
   document.querySelector("#detail-add-event")?.addEventListener("click", () => openEventModal());
+
+  document.querySelector<HTMLFormElement>("#place-form")?.addEventListener("submit", (event) => void submitPlace(event));
+  document.querySelector("#search-place-btn")?.addEventListener("click", () => void searchPlaceFromModal());
+  document.querySelectorAll<HTMLElement>("[data-map-result]").forEach((button) => button.addEventListener("click", () => selectMapResult(Number(button.dataset.mapResult))));
+  document.querySelector("#delete-place-btn")?.addEventListener("click", () => void deleteCurrentPlace());
 
   document.querySelector<HTMLFormElement>("#create-space-form")?.addEventListener("submit", (event) => void submitCreateSpace(event));
   document.querySelector<HTMLFormElement>("#join-space-form")?.addEventListener("submit", (event) => void submitJoinSpace(event));
@@ -917,20 +1198,43 @@ function openModal(modal: ModalName): void {
 function closeModal(): void {
   state.modal = null;
   state.editingEvent = null;
-  state.draft = null;
+  state.editingPlace = null;
+  state.eventPlacePrefill = null;
+  state.mapSearchResults = [];
   render();
 }
 
 function openEventModal(event: CalendarEvent | null = null): void {
   state.editingEvent = event;
+  state.eventPlacePrefill = null;
   state.modal = "event";
   render();
 }
+
+function openPlaceModal(place: Place | null = null): void {
+  state.editingPlace = place;
+  state.mapSearchResults = [];
+  state.modal = "place";
+  render();
+}
+
+function planPlace(placeId: string): void {
+  const place = state.places.find((item) => item.id === placeId);
+  if (!place) return;
+  state.editingEvent = null;
+  state.eventPlacePrefill = place;
+  state.modal = "event";
+  render();
+}
+
+
 
 async function switchSpace(spaceId: string): Promise<void> {
   if (!spaceId || spaceId === state.activeSpaceId) return;
   state.activeSpaceId = spaceId;
   state.visibleMemberIds = new Set();
+  state.selectedPlaceId = null;
+  state.places = [];
   localStorage.setItem("activeSpaceId", spaceId);
   await loadSpace(spaceId);
   render();
@@ -979,16 +1283,24 @@ async function submitEvent(event: SubmitEvent): Promise<void> {
   const assignedUserIds = isSpaceAdmin()
     ? formData.getAll("assignedUserIds").map(String)
     : [state.me?.id ?? ""];
+  const selectedSpaceIds = new Set(formData.getAll("spaceIds").map(String));
+  selectedSpaceIds.add(state.activeSpaceId);
   const payload = {
     title: formData.get("title"),
     startDate: formData.get("startDate"),
     allDay,
     startTime: allDay ? null : formData.get("startTime"),
     endTime: allDay ? null : formData.get("endTime"),
+    placeId: formData.get("placeId") || null,
     location: formData.get("location"),
+    placeAddress: formData.get("placeAddress"),
+    latitude: formData.get("latitude") || null,
+    longitude: formData.get("longitude") || null,
     companions: formData.get("companions"),
     notes: formData.get("notes"),
     assignedUserIds,
+    spaceIds: [...selectedSpaceIds],
+    currentSpaceId: state.activeSpaceId,
     source: state.editingEvent?.source ?? "manual",
   };
   setFormBusy(form, true);
@@ -1002,7 +1314,8 @@ async function submitEvent(event: SubmitEvent): Promise<void> {
     }
     state.modal = null;
     state.editingEvent = null;
-    await loadEvents();
+    state.eventPlacePrefill = null;
+    await Promise.all([loadEvents(), loadPlaces()]);
     render();
   } catch (error) {
     toast(errorMessage(error), "error");
@@ -1011,15 +1324,21 @@ async function submitEvent(event: SubmitEvent): Promise<void> {
   }
 }
 
-async function deleteCurrentEvent(): Promise<void> {
-  if (!state.editingEvent) return;
-  if (!confirm(`确认删除“${state.editingEvent.title}”吗？`)) return;
+async function deleteCurrentEvent(mode: "detach" | "all"): Promise<void> {
+  if (!state.editingEvent || !state.activeSpaceId) return;
+  const multiSpace = state.editingEvent.spaceIds.length > 1;
+  const message = mode === "all" && multiSpace
+    ? `确认从全部 ${state.editingEvent.spaceIds.length} 个空间彻底删除“${state.editingEvent.title}”吗？`
+    : multiSpace
+      ? `确认只从当前空间移除“${state.editingEvent.title}”吗？其他空间仍会保留。`
+      : `确认删除“${state.editingEvent.title}”吗？`;
+  if (!confirm(message)) return;
   try {
-    await api(`/api/events/${state.editingEvent.id}`, { method: "DELETE" });
-    toast("日程已删除");
+    await api(`/api/events/${state.editingEvent.id}?spaceId=${encodeURIComponent(state.activeSpaceId)}&mode=${mode}`, { method: "DELETE" });
+    toast(mode === "all" ? "日程已从全部空间删除" : "日程已从当前空间移除");
     state.modal = null;
     state.editingEvent = null;
-    await loadEvents();
+    await Promise.all([loadEvents(), loadPlaces()]);
     render();
   } catch (error) {
     toast(errorMessage(error), "error");
@@ -1030,22 +1349,36 @@ async function submitSmartParse(event: SubmitEvent): Promise<void> {
   event.preventDefault();
   if (!state.activeSpaceId) return;
   const form = event.currentTarget as HTMLFormElement;
-  const text = String(new FormData(form).get("text") ?? "");
+  const text = String(new FormData(form).get("text") ?? "").trim();
+  if (!text) return;
+  state.chatMessages.push({ id: crypto.randomUUID(), role: "user", text });
+  state.chatTextParts.push(text);
+  form.reset();
   setFormBusy(form, true);
   try {
+    const combinedText = state.chatTextParts.join("；");
     const result = await api<{ draft: EventDraft }>(`/api/spaces/${state.activeSpaceId}/parse`, {
       method: "POST",
       body: {
-        text,
+        text: combinedText,
         anchorYear: state.viewYear,
         anchorMonth: state.viewMonth,
         referenceDate: localDateString(new Date()),
       },
     });
     state.draft = result.draft;
+    state.chatMessages.push({
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: `已整理成草稿：${result.draft.date} ${result.draft.allDay ? "全天" : result.draft.startTime ?? ""}，${result.draft.title}。请检查后确认。`,
+    });
+    state.draftPlace = null;
+    state.mapSearchResults = result.draft.location ? await searchMapCandidates(result.draft.location) : [];
     render();
+    window.setTimeout(() => document.querySelector("#chat-thread")?.scrollTo({ top: 99999, behavior: "smooth" }), 20);
   } catch (error) {
-    toast(errorMessage(error), "error");
+    state.chatMessages.push({ id: crypto.randomUUID(), role: "assistant", text: `${errorMessage(error)}。可以继续补充日期、时间或地点。` });
+    render();
   } finally {
     setFormBusy(form, false);
   }
@@ -1055,6 +1388,11 @@ async function confirmDraft(): Promise<void> {
   if (!state.activeSpaceId || !state.draft) return;
   const draft = state.draft;
   try {
+    const selectedSpaceIds = new Set(
+      [...document.querySelectorAll<HTMLInputElement>('input[name="draftSpaceIds"]:checked')].map((input) => input.value),
+    );
+    selectedSpaceIds.add(state.activeSpaceId);
+    const placeId = await ensureDraftPlaceInLibrary();
     await api(`/api/spaces/${state.activeSpaceId}/events`, {
       method: "POST",
       body: {
@@ -1063,10 +1401,15 @@ async function confirmDraft(): Promise<void> {
         startTime: draft.startTime,
         endTime: draft.endTime,
         allDay: draft.allDay,
-        location: draft.location,
+        placeId,
+        location: state.draftPlace?.name ?? draft.location,
+        placeAddress: state.draftPlace?.address ?? "",
+        latitude: state.draftPlace?.latitude ?? null,
+        longitude: state.draftPlace?.longitude ?? null,
         companions: draft.companions,
         notes: draft.notes,
         assignedUserIds: draft.assignedUserIds,
+        spaceIds: [...selectedSpaceIds],
         source: draft.source,
       },
     });
@@ -1076,12 +1419,188 @@ async function confirmDraft(): Promise<void> {
     state.viewMonth = date.getMonth() + 1;
     state.modal = null;
     state.draft = null;
-    await loadEvents();
-    toast("已加入日历");
+    state.draftPlace = null;
+    state.chatMessages = [];
+    state.chatTextParts = [];
+    state.mapSearchResults = [];
+    await Promise.all([loadEvents(), loadPlaces()]);
+    toast(selectedSpaceIds.size > 1 ? `已创建并同步到 ${selectedSpaceIds.size} 个空间` : "已加入日历");
     render();
   } catch (error) {
     toast(errorMessage(error), "error");
   }
+}
+
+async function ensureDraftPlaceInLibrary(): Promise<string | null> {
+  if (!state.activeSpaceId || !state.draftPlace) return null;
+  const existing = state.places.find((place) =>
+    (place.latitude !== null && place.longitude !== null
+      && Math.abs(place.latitude - (state.draftPlace?.latitude ?? 999)) < 0.00001
+      && Math.abs(place.longitude - (state.draftPlace?.longitude ?? 999)) < 0.00001)
+    || (place.name === state.draftPlace?.name && place.address === state.draftPlace?.address),
+  );
+  if (existing) return existing.id;
+  const result = await api<{ place: Place }>(`/api/spaces/${state.activeSpaceId}/places`, {
+    method: "POST",
+    body: {
+      name: state.draftPlace.name,
+      address: state.draftPlace.address,
+      latitude: state.draftPlace.latitude,
+      longitude: state.draftPlace.longitude,
+      category: "其他",
+      status: "planned",
+      notes: "由智能添加日程自动加入地点库",
+    },
+  });
+  state.places.push(result.place);
+  return result.place.id;
+}
+
+function selectDraftMapResult(index: number): void {
+  const result = state.mapSearchResults[index];
+  if (!result) return;
+  state.draftPlace = {
+    name: result.name || result.display_name.split(",")[0],
+    address: result.display_name,
+    latitude: Number(result.lat),
+    longitude: Number(result.lon),
+  };
+  render();
+}
+
+let lastMapSearchAt = 0;
+async function searchMapCandidates(query: string): Promise<MapSearchResult[]> {
+  const clean = query.trim();
+  if (!clean) return [];
+  const wait = Math.max(0, 1100 - (Date.now() - lastMapSearchAt));
+  if (wait) await new Promise((resolve) => window.setTimeout(resolve, wait));
+  const url = new URL("https://nominatim.openstreetmap.org/search");
+  url.searchParams.set("format", "jsonv2");
+  url.searchParams.set("q", clean);
+  url.searchParams.set("limit", "5");
+  url.searchParams.set("accept-language", "zh-CN");
+  url.searchParams.set("addressdetails", "1");
+  const response = await fetch(url.toString(), { headers: { Accept: "application/json" } });
+  lastMapSearchAt = Date.now();
+  if (!response.ok) throw new Error(`地图搜索暂时不可用（${response.status}）`);
+  const results = await response.json() as MapSearchResult[];
+  return Array.isArray(results) ? results.slice(0, 5) : [];
+}
+
+async function searchPlaceFromModal(): Promise<void> {
+  const input = document.querySelector<HTMLInputElement>("#place-search-query");
+  const button = document.querySelector<HTMLButtonElement>("#search-place-btn");
+  const query = input?.value.trim() ?? "";
+  if (!query) {
+    toast("请输入地点或地址", "error");
+    return;
+  }
+  if (button) button.disabled = true;
+  try {
+    state.mapSearchResults = await searchMapCandidates(query);
+    if (!state.mapSearchResults.length) toast("没有搜索到匹配地点", "error");
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function selectMapResult(index: number): void {
+  const result = state.mapSearchResults[index];
+  if (!result) return;
+  const form = document.querySelector<HTMLFormElement>("#place-form");
+  if (!form) return;
+  const name = result.name || result.display_name.split(",")[0];
+  const set = (field: string, value: string): void => {
+    const input = form.elements.namedItem(field) as HTMLInputElement | null;
+    if (input) input.value = value;
+  };
+  set("name", name);
+  set("address", result.display_name);
+  set("latitude", result.lat);
+  set("longitude", result.lon);
+  form.querySelectorAll<HTMLElement>("[data-map-result]").forEach((button, itemIndex) => button.classList.toggle("selected", itemIndex === index));
+}
+
+async function submitPlace(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (!state.activeSpaceId) return;
+  const form = event.currentTarget as HTMLFormElement;
+  const data = new FormData(form);
+  const body = {
+    name: data.get("name"),
+    address: data.get("address"),
+    latitude: data.get("latitude") || null,
+    longitude: data.get("longitude") || null,
+    category: data.get("category"),
+    status: data.get("status"),
+    notes: data.get("notes"),
+  };
+  setFormBusy(form, true);
+  try {
+    if (state.editingPlace) {
+      await api(`/api/places/${state.editingPlace.id}`, { method: "PATCH", body });
+      toast("地点已更新");
+    } else {
+      const result = await api<{ place: Place }>(`/api/spaces/${state.activeSpaceId}/places`, { method: "POST", body });
+      state.selectedPlaceId = result.place.id;
+      toast("地点已加入共享地图");
+    }
+    state.modal = null;
+    state.editingPlace = null;
+    state.mapSearchResults = [];
+    await Promise.all([loadPlaces(), loadEvents()]);
+    state.viewMode = "map";
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  } finally {
+    setFormBusy(form, false);
+  }
+}
+
+async function deleteCurrentPlace(): Promise<void> {
+  if (!state.editingPlace || !confirm(`确认删除地点“${state.editingPlace.name}”吗？已存在的日程仍会保留地点文字。`)) return;
+  try {
+    await api(`/api/places/${state.editingPlace.id}`, { method: "DELETE" });
+    state.modal = null;
+    state.selectedPlaceId = null;
+    state.editingPlace = null;
+    await Promise.all([loadPlaces(), loadEvents()]);
+    toast("地点已删除");
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
+}
+
+async function togglePlaceLike(placeId: string): Promise<void> {
+  if (!placeId) return;
+  try {
+    const result = await api<{ place: Place }>(`/api/places/${placeId}/like?spaceId=${encodeURIComponent(state.activeSpaceId ?? "")}`, { method: "POST" });
+    state.places = state.places.map((place) => place.id === placeId ? result.place : place);
+    render();
+  } catch (error) {
+    toast(errorMessage(error), "error");
+  }
+}
+
+function syncSelectedPlaceIntoEventForm(): void {
+  const select = document.querySelector<HTMLSelectElement>("#event-place-select");
+  const form = document.querySelector<HTMLFormElement>("#event-form");
+  if (!select || !form) return;
+  const place = state.places.find((item) => item.id === select.value);
+  if (!place) return;
+  const set = (field: string, value: string): void => {
+    const input = form.elements.namedItem(field) as HTMLInputElement | null;
+    if (input) input.value = value;
+  };
+  set("location", place.name);
+  set("placeAddress", place.address);
+  set("latitude", place.latitude === null ? "" : String(place.latitude));
+  set("longitude", place.longitude === null ? "" : String(place.longitude));
 }
 
 async function submitCreateSpace(event: SubmitEvent): Promise<void> {
@@ -1483,7 +2002,7 @@ function hexToRgba(hex: string, alpha: number): string {
   return `rgba(${red},${green},${blue},${alpha})`;
 }
 
-function uiIcon(name: "sparkles" | "folderPlus" | "logIn" | "mail" | "settings" | "users" | "logout" | "folder" | "chevronLeft" | "chevronRight" | "calendarPlus" | "palette" | "userPlus" | "sliders" | "bot"): string {
+function uiIcon(name: "sparkles" | "folderPlus" | "logIn" | "mail" | "settings" | "users" | "logout" | "folder" | "chevronLeft" | "chevronRight" | "calendarPlus" | "palette" | "userPlus" | "sliders" | "bot" | "mapPin"): string {
   const paths: Record<string, string> = {
     sparkles: '<path d="m12 3-1.2 3.1L8 7.4l2.8 1.3L12 12l1.2-3.3L16 7.4l-2.8-1.3L12 3Z"/><path d="m5 13-.8 2.1L2 16l2.2.9L5 19l.8-2.1L8 16l-2.2-.9L5 13Z"/><path d="m19 12-.6 1.6L17 14l1.4.4L19 16l.6-1.6L21 14l-1.4-.4L19 12Z"/>',
     folderPlus: '<path d="M3 6.5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6.5Z"/><path d="M12 10v6M9 13h6"/>',
@@ -1500,6 +2019,7 @@ function uiIcon(name: "sparkles" | "folderPlus" | "logIn" | "mail" | "settings" 
     userPlus: '<path d="M15 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8" cy="7" r="4"/><path d="M19 8v6M16 11h6"/>',
     sliders: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
     bot: '<rect x="4" y="6" width="16" height="13" rx="3"/><path d="M12 2v4M8 11h.01M16 11h.01M8 15h8"/>',
+    mapPin: '<path d="M20 10c0 5-8 11-8 11S4 15 4 10a8 8 0 1 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/>',
   };
   return `<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${paths[name]}</svg>`;
 }
