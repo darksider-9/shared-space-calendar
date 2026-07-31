@@ -439,26 +439,66 @@ function renderApp(): void {
 
 function renderTopbar(): string {
   const activeId = state.activeSpaceId ?? "";
+  const activeSpaceName = state.activeSpace?.name ?? "尚未选择空间";
   return `
     <header class="topbar panel-glass">
-      <div class="brand-compact"><div class="brand-mark small">日</div><div><strong>共享日历</strong><small>Space Calendar</small></div></div>
-      <div class="space-switcher">
-        <select id="space-select" class="field compact" aria-label="选择空间">
-          ${state.spaces.map((space) => `<option value="${space.id}" ${space.id === activeId ? "selected" : ""}>${escapeHtml(space.icon)} ${escapeHtml(space.name)}</option>`).join("")}
-        </select>
-        <button class="icon-btn" id="create-space-btn" title="创建空间">＋</button>
-        <button class="icon-btn" id="join-space-btn" title="申请加入空间">⌁</button>
+      <div class="topbar-main">
+        <div class="brand-compact">
+          <div class="brand-mark small">日</div>
+          <div><strong>共享日历</strong><small>多人空间日历</small></div>
+        </div>
+        <label class="space-context" for="space-select">
+          <span class="space-context-label">当前空间</span>
+          <select id="space-select" class="field compact" aria-label="切换当前空间" ${state.spaces.length ? "" : "disabled"}>
+            ${state.spaces.length
+              ? state.spaces.map((space) => `<option value="${space.id}" ${space.id === activeId ? "selected" : ""}>${escapeHtml(space.icon)} ${escapeHtml(space.name)}</option>`).join("")
+              : `<option value="">还没有空间</option>`}
+          </select>
+        </label>
+        <div class="top-actions">
+          <button class="secondary-btn smart-entry-btn" id="smart-add-btn" ${state.activeSpaceId ? "" : "disabled"} title="用自然语言添加日程">
+            ${uiIcon("sparkles")}<span>智能添加</span>
+          </button>
+          <button class="user-button" id="user-menu-btn" title="退出当前账号">
+            <span class="user-avatar">${escapeHtml(initials(state.me?.displayName ?? "我"))}</span>
+            <span class="user-copy"><strong>${escapeHtml(state.me?.displayName ?? "")}</strong><small>点击退出登录</small></span>
+            ${uiIcon("logout")}
+          </button>
+        </div>
       </div>
-      <nav class="view-tabs">
-        <button class="${state.viewMode === "month" ? "active" : ""}" data-view="month">月历</button>
-        <button class="${state.viewMode === "day" ? "active" : ""}" data-view="day">日视图</button>
-      </nav>
-      <div class="top-actions">
-        <button class="secondary-btn" id="smart-add-btn" ${state.activeSpaceId ? "" : "disabled"}>✦ 智能添加</button>
-        <button class="icon-btn notification-btn" id="notifications-btn" title="空间邀请">◎${state.invitations.length ? `<b>${state.invitations.length}</b>` : ""}</button>
-        ${state.me?.isPlatformAdmin ? `<button class="icon-btn" id="platform-admin-btn" title="平台管理">盾</button>` : ""}
-        <button class="user-button" id="user-menu-btn"><span>${escapeHtml(initials(state.me?.displayName ?? "我"))}</span><i>${escapeHtml(state.me?.displayName ?? "")}</i></button>
+      <div class="topbar-tools">
+        <nav class="space-commandbar" aria-label="空间功能">
+          <button class="command-btn" id="create-space-btn" title="创建一个新的共享日历空间">
+            <span class="command-icon">${uiIcon("folderPlus")}</span>
+            <span class="command-copy"><strong>创建共享空间</strong><small>新建独立日历</small></span>
+          </button>
+          <button class="command-btn" id="join-space-btn" title="使用空间邀请码申请加入">
+            <span class="command-icon">${uiIcon("logIn")}</span>
+            <span class="command-copy"><strong>加入空间</strong><small>输入邀请码申请</small></span>
+          </button>
+          <button class="command-btn notification-btn" id="notifications-btn" title="查看别人发给你的空间邀请">
+            <span class="command-icon">${uiIcon("mail")}</span>
+            <span class="command-copy"><strong>空间邀请</strong><small>${state.invitations.length ? `${state.invitations.length} 条待处理` : "暂无待处理邀请"}</small></span>
+            ${state.invitations.length ? `<b>${state.invitations.length}</b>` : ""}
+          </button>
+          ${state.activeSpaceId ? `<button class="command-btn" id="space-manage-btn" title="管理当前空间的成员、颜色、邀请和 AI">
+            <span class="command-icon">${uiIcon("settings")}</span>
+            <span class="command-copy"><strong>空间管理</strong><small>成员、颜色与 AI</small></span>
+          </button>` : ""}
+          ${state.me?.isPlatformAdmin ? `<button class="command-btn admin-command" id="platform-admin-btn" title="管理平台上的全部账号">
+            <span class="command-icon">${uiIcon("users")}</span>
+            <span class="command-copy"><strong>账号管理</strong><small>停用或重置账号</small></span>
+          </button>` : ""}
+        </nav>
+        <div class="view-switcher-wrap">
+          <span>视图</span>
+          <nav class="view-tabs" aria-label="日历视图">
+            <button class="${state.viewMode === "month" ? "active" : ""}" data-view="month">月历</button>
+            <button class="${state.viewMode === "day" ? "active" : ""}" data-view="day">日时间轴</button>
+          </nav>
+        </div>
       </div>
+      <div class="space-status-line"><span>${uiIcon("folder")}</span><strong>${escapeHtml(activeSpaceName)}</strong><small>${state.activeSpace ? `${state.activeSpace.memberCount} 位成员 · ${roleLabel(state.activeSpace.role)}` : "创建或加入空间后即可开始共享日程"}</small></div>
     </header>`;
 }
 
@@ -489,20 +529,22 @@ function renderCalendarToolbar(): string {
   return `
     <section class="calendar-toolbar panel-glass">
       <div class="date-nav">
-        <button class="icon-btn" id="prev-period">‹</button>
-        <button class="date-title" id="date-title-btn">${state.viewMode === "month" ? monthLabel : dayLabel}<small>${escapeHtml(state.activeSpace?.name ?? "")}</small></button>
-        <button class="icon-btn" id="next-period">›</button>
-        <button class="ghost-btn" id="today-btn">今天</button>
+        <button class="icon-btn" id="prev-period" aria-label="上一${state.viewMode === "month" ? "个月" : "天"}" title="上一${state.viewMode === "month" ? "个月" : "天"}">${uiIcon("chevronLeft")}</button>
+        <div class="date-title">${state.viewMode === "month" ? monthLabel : dayLabel}<small>${state.viewMode === "month" ? "点击日期查看当天详情" : "按成员查看当天时间安排"}</small></div>
+        <button class="icon-btn" id="next-period" aria-label="下一${state.viewMode === "month" ? "个月" : "天"}" title="下一${state.viewMode === "month" ? "个月" : "天"}">${uiIcon("chevronRight")}</button>
+        <button class="ghost-btn" id="today-btn">回到今天</button>
       </div>
-      <div class="member-filters">
-        ${state.members.map((member) => {
-          const active = state.visibleMemberIds.has(member.id);
-          return `<button class="member-filter ${active ? "active" : ""}" data-member-filter="${member.id}" style="--member:${member.color}"><i></i>${escapeHtml(member.displayName)}</button>`;
-        }).join("")}
+      <div class="member-filter-wrap">
+        <span class="toolbar-label">显示成员</span>
+        <div class="member-filters">
+          ${state.members.map((member) => {
+            const active = state.visibleMemberIds.has(member.id);
+            return `<button class="member-filter ${active ? "active" : ""}" data-member-filter="${member.id}" style="--member:${member.color}" title="${active ? "点击隐藏" : "点击显示"}${escapeAttr(member.displayName)}的日程"><i></i>${escapeHtml(member.displayName)}</button>`;
+          }).join("")}
+        </div>
       </div>
       <div class="toolbar-actions">
-        <button class="secondary-btn" id="new-event-btn">＋ 新建日程</button>
-        <button class="icon-btn" id="space-manage-btn" title="空间设置">⚙</button>
+        <button class="primary-btn new-event-clear-btn" id="new-event-btn">${uiIcon("calendarPlus")}<span>新建日程</span></button>
       </div>
     </section>`;
 }
@@ -699,25 +741,27 @@ function renderDayEventCard(event: CalendarEvent, member: Member): string {
 function renderCreateSpaceModal(): string {
   return modalShell("创建共享空间", `
     <form id="create-space-form" class="modal-body stack-form">
+      <div class="modal-guide">${uiIcon("folderPlus")}<div><strong>新建一个独立的共享日历</strong><p>不同空间的成员、颜色、日程和 AI 设置互不影响。</p></div></div>
       <label>空间名称<input class="field" name="name" required maxlength="40" placeholder="例如：我们三个同学" /></label>
-      <label>图标<input class="field" name="icon" maxlength="4" value="✦" placeholder="一个 Emoji 或符号" /></label>
-      <label>空间简介<textarea class="field" name="description" maxlength="160" placeholder="这个空间用来做什么"></textarea></label>
-      <div class="soft-note">创建后你会成为空间所有者，可以邀请成员、设置管理员和配置 AI。</div>
-      <div class="modal-actions end"><button type="button" class="ghost-btn" id="cancel-modal">取消</button><button class="primary-btn" type="submit">创建空间</button></div>
+      <label>空间图标<input class="field" name="icon" maxlength="4" value="✦" placeholder="输入一个 Emoji，例如 👥" /></label>
+      <label>空间简介<textarea class="field" name="description" maxlength="160" placeholder="简单说明这个空间用于什么"></textarea></label>
+      <div class="soft-note">创建完成后，你会成为该空间的所有者，可以邀请成员、设置管理员、调整成员颜色和配置空间 AI。</div>
+      <div class="modal-actions end"><button type="button" class="ghost-btn" id="cancel-modal">取消</button><button class="primary-btn" type="submit">确认创建共享空间</button></div>
     </form>`);
 }
 
 function renderJoinSpaceModal(): string {
-  return modalShell("申请加入空间", `
+  return modalShell("通过邀请码加入空间", `
     <form id="join-space-form" class="modal-body stack-form">
+      <div class="modal-guide">${uiIcon("logIn")}<div><strong>申请加入别人创建的共享空间</strong><p>向空间管理员索要邀请码，提交后等待管理员同意。</p></div></div>
       <label>空间邀请码<input class="field code-input" name="inviteCode" required maxlength="24" placeholder="例如 ABCD2345" /></label>
-      <div class="soft-note">提交后需要空间管理员同意。加入后才能看到该空间成员和日程。</div>
-      <div class="modal-actions end"><button type="button" class="ghost-btn" id="cancel-modal">取消</button><button class="primary-btn" type="submit">提交申请</button></div>
+      <div class="soft-note">通过申请后，你才能看到该空间的成员与共享日程。不同空间之间的数据不会混在一起。</div>
+      <div class="modal-actions end"><button type="button" class="ghost-btn" id="cancel-modal">取消</button><button class="primary-btn" type="submit">提交加入申请</button></div>
     </form>`);
 }
 
 function renderNotificationsModal(): string {
-  return modalShell("空间邀请", `
+  return modalShell("收到的空间邀请", `
     <div class="modal-body">
       ${state.invitations.length ? `<div class="notification-list">${state.invitations.map((item) => `<article class="notification-card"><div class="space-icon">◫</div><div><strong>${escapeHtml(item.inviterName)} 邀请你加入</strong><h3>${escapeHtml(item.spaceName)}</h3><small>${formatDateTime(item.createdAt)}</small></div><div class="notification-actions"><button class="ghost-btn" data-invite-decline="${item.id}">拒绝</button><button class="primary-btn" data-invite-accept="${item.id}">接受</button></div></article>`).join("")}</div>` : `<div class="empty-state large">暂时没有待处理的空间邀请。</div>`}
     </div>`);
@@ -725,13 +769,13 @@ function renderNotificationsModal(): string {
 
 function renderSpaceManageModal(): string {
   const tab = state.manageTab;
-  return modalShell("空间管理", `
+  return modalShell(`管理空间：${state.activeSpace?.name ?? ""}`, `
     <div class="manage-layout">
-      <aside class="manage-tabs">
-        <button class="${tab === "members" ? "active" : ""}" data-manage-tab="members">成员与颜色</button>
-        <button class="${tab === "invite" ? "active" : ""}" data-manage-tab="invite">邀请与申请</button>
-        <button class="${tab === "settings" ? "active" : ""}" data-manage-tab="settings">空间设置</button>
-        <button class="${tab === "ai" ? "active" : ""}" data-manage-tab="ai">AI 设置</button>
+      <aside class="manage-tabs" aria-label="空间管理功能">
+        <button class="${tab === "members" ? "active" : ""}" data-manage-tab="members"><span>${uiIcon("palette")}</span><span><strong>成员与颜色</strong><small>角色、颜色与移除</small></span></button>
+        <button class="${tab === "invite" ? "active" : ""}" data-manage-tab="invite"><span>${uiIcon("userPlus")}</span><span><strong>邀请与申请</strong><small>邀请账号、审批加入</small></span></button>
+        <button class="${tab === "settings" ? "active" : ""}" data-manage-tab="settings"><span>${uiIcon("sliders")}</span><span><strong>空间资料设置</strong><small>名称、图标与权限</small></span></button>
+        <button class="${tab === "ai" ? "active" : ""}" data-manage-tab="ai"><span>${uiIcon("bot")}</span><span><strong>空间 AI 配置</strong><small>接口、模型与密钥</small></span></button>
       </aside>
       <div class="manage-content">${renderManageContent()}</div>
     </div>`, "wide-modal manage-modal");
@@ -786,7 +830,7 @@ function renderAIManage(): string {
 }
 
 function renderPlatformAdminModal(): string {
-  return modalShell("平台账号管理", `
+  return modalShell("平台账号管理（仅平台管理员）", `
     <div class="modal-body platform-admin-body">
       <div class="section-heading"><div><h3>全部账号</h3><p>平台管理员可以停用账号或重置密码，但不能直接查看用户密码。</p></div><span>${state.platformUsers.length} 个账号</span></div>
       <div class="platform-user-list">${state.platformUsers.map((account) => `<article><div class="member-avatar neutral">${escapeHtml(initials(account.displayName))}</div><div class="member-info"><strong>${escapeHtml(account.displayName)}${account.isPlatformAdmin ? " · 平台管理员" : ""}</strong><small>@${escapeHtml(account.username)} · ${account.spaces} 个空间 · ${account.disabled ? "已停用" : "正常"}</small></div><button class="${account.disabled ? "secondary-btn" : "danger-btn"}" data-toggle-user="${account.id}" data-disabled="${account.disabled ? "1" : "0"}">${account.disabled ? "恢复" : "停用"}</button><button class="ghost-btn" data-reset-password="${account.id}">重置密码</button></article>`).join("")}</div>
@@ -1437,6 +1481,27 @@ function hexToRgba(hex: string, alpha: number): string {
   const green = Number.parseInt(clean.slice(2, 4), 16);
   const blue = Number.parseInt(clean.slice(4, 6), 16);
   return `rgba(${red},${green},${blue},${alpha})`;
+}
+
+function uiIcon(name: "sparkles" | "folderPlus" | "logIn" | "mail" | "settings" | "users" | "logout" | "folder" | "chevronLeft" | "chevronRight" | "calendarPlus" | "palette" | "userPlus" | "sliders" | "bot"): string {
+  const paths: Record<string, string> = {
+    sparkles: '<path d="m12 3-1.2 3.1L8 7.4l2.8 1.3L12 12l1.2-3.3L16 7.4l-2.8-1.3L12 3Z"/><path d="m5 13-.8 2.1L2 16l2.2.9L5 19l.8-2.1L8 16l-2.2-.9L5 13Z"/><path d="m19 12-.6 1.6L17 14l1.4.4L19 16l.6-1.6L21 14l-1.4-.4L19 12Z"/>',
+    folderPlus: '<path d="M3 6.5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6.5Z"/><path d="M12 10v6M9 13h6"/>',
+    logIn: '<path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="m10 8 4 4-4 4M14 12H3"/>',
+    mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/>',
+    settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/>',
+    users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/>',
+    logout: '<path d="M10 17l5-5-5-5M15 12H3"/><path d="M14 3h5a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-5"/>',
+    folder: '<path d="M3 6.5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6.5Z"/>',
+    chevronLeft: '<path d="m15 18-6-6 6-6"/>',
+    chevronRight: '<path d="m9 18 6-6-6-6"/>',
+    calendarPlus: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18M12 14v4M10 16h4"/>',
+    palette: '<path d="M12 3a9 9 0 0 0 0 18h1.2a1.8 1.8 0 0 0 1.4-2.9l-.2-.3a1.8 1.8 0 0 1 1.4-2.9H17a4 4 0 0 0 4-4A8 8 0 0 0 12 3Z"/><circle cx="7.5" cy="10" r=".7"/><circle cx="10" cy="6.8" r=".7"/><circle cx="14" cy="6.8" r=".7"/><circle cx="16.5" cy="10" r=".7"/>',
+    userPlus: '<path d="M15 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8" cy="7" r="4"/><path d="M19 8v6M16 11h6"/>',
+    sliders: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+    bot: '<rect x="4" y="6" width="16" height="13" rx="3"/><path d="M12 2v4M8 11h.01M16 11h.01M8 15h8"/>',
+  };
+  return `<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${paths[name]}</svg>`;
 }
 
 function escapeHtml(value: unknown): string {
